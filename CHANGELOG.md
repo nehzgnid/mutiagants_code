@@ -676,6 +676,89 @@ Verification: `.\.venv\Scripts\python.exe -m pytest backend\tests -q` passed wit
 
 ### Plan
 
+- Requirements analysis: the task configuration dialog exposed an initial-requirement field even though task requirements are entered and refined through the conversation. Re-editing it would create a second, misleading task-editing surface.
+- High-level design: limit task configuration to stable task metadata: title and Agent permission. Preserve the original persisted requirement for compatibility and history, but do not expose it as an editable control.
+- Detailed design: remove the frontend textarea and its payload field, narrow the task-update request model, and assert that a configuration update leaves the existing requirement unchanged.
+
+Verification: reviewed task creation, conversation entry, task update, and configuration-modal flows.
+
+### Code
+
+- Removed the “初始需求” field from task configuration and stopped accepting it from the task configuration update endpoint.
+- Kept task title, permission selection, task deletion, and the existing conversation-based requirement workflow unchanged.
+
+Verification: `npm --prefix frontend run build` passed.
+
+### Code Review
+
+- Confirmed configuration updates can no longer overwrite historical requirement data and that all user-facing requirement editing remains in the task conversation.
+
+Verification: static review of `frontend/src/main.tsx` and `backend/app/main.py`.
+
+### Unit Testing
+
+- Updated task-management coverage to assert the persisted requirement remains unchanged and the removed field is absent from the frontend source.
+
+Verification: `.\.venv\Scripts\python.exe -m pytest backend\tests -q` passed with 19 tests and 1 existing Starlette deprecation warning.
+
+### Plan
+
+- Requirements analysis: the Vite development page at port 5173 served its HTML fallback for `/api/tasks`, so the frontend attempted to parse a script-tag response as JSON. The backend already uses port 8787, but the development server had no API forwarding rule.
+- High-level design: keep browser requests relative to `/api` and configure the Vite development server as the local reverse proxy to the existing backend port.
+- Detailed design: add a `/api` proxy targeting `127.0.0.1:8787`, permit the Vite development origins in backend CORS, and lock the proxy contract with a focused source test.
+
+Verification: reproduced `GET http://127.0.0.1:5173/api/tasks` returning Vite HTML and confirmed no backend process was listening on port 8787.
+
+### Configuration
+
+- Added Vite development-server proxying for `/api` to `http://127.0.0.1:8787` and added the `5173` localhost origins to backend CORS.
+
+Verification: with FastAPI running on port 8787, `Invoke-WebRequest http://127.0.0.1:5173/api/tasks` returned task JSON rather than Vite HTML; `GET /api/health` returned 200.
+
+### Code Review
+
+- Confirmed all frontend API requests already use the `/api` prefix, so proxying applies consistently without changing production API paths or request code.
+
+Verification: static review of `frontend/src/main.tsx`, `frontend/vite.config.ts`, and `backend/app/main.py`.
+
+### Unit Testing
+
+- Added a focused frontend development-proxy configuration contract test.
+
+Verification: `.\.venv\Scripts\python.exe -m pytest backend\tests -q` passed with 19 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
+
+### Plan
+
+- Requirements analysis: the left task list needed task-scoped management without making the primary selection action harder to use. Hovering a task must provide a configuration control, and users need a deliberate way to change configuration or remove obsolete task history.
+- High-level design: retain single-click task selection; show a compact overflow control on hover or keyboard focus; place configuration and deletion in a task-level menu. Keep code directories and reusable workspace records intact when a task is deleted.
+- Detailed design: add task update and delete APIs; provide a configuration modal for title, initial requirement, and permission; confirm destructive deletion in the browser; remove task conversation and stage data through the existing ORM cascade.
+
+Verification: reviewed the task model relationships, existing task creation and permission APIs, sidebar layout, and frontend component patterns.
+
+### Code
+
+- Added a darker hover/focus state and overflow configuration button to every left-sidebar task row, with menu actions for changing configuration and deleting the task.
+- Added a task configuration modal that saves the task title, initial requirement, and Agent permission.
+- Added `PATCH /api/tasks/{task_id}` and `DELETE /api/tasks/{task_id}`. Deletion removes only the task and dependent task records; the bound Git workspace remains available for other tasks.
+
+Verification: `npm --prefix frontend run build` passed; `git diff --check` passed.
+
+### Code Review
+
+- Confirmed task selection remains a direct row action while the overflow button has an independent event target; keyboard focus also reveals the control.
+- Confirmed deletion is explicitly confirmed and clears the active frontend selection, while ORM task relationships remove dependent messages and stage records without deleting the workspace path.
+- Confirmed configuration updates refresh both the sidebar and the active conversation state.
+
+Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, and `frontend/src/styles.css`.
+
+### Unit Testing
+
+- Added task API coverage for configuration persistence and deletion, plus a frontend source contract covering the overflow control, configuration action, delete action, and hover styles.
+
+Verification: `.\.venv\Scripts\python.exe -m pytest backend\tests -q` passed with 18 tests and 1 existing Starlette deprecation warning.
+
+### Plan
+
 - Requirements analysis: a completed compression trace must communicate completion explicitly rather than retaining the in-progress title after the operation ends.
 - High-level design: use the existing streamed completion/error events to update the activity trace title and append a terminal status row.
 - Detailed design: on success, show the resulting token ratio; on either stream or request failure, label the trace as failed while retaining the error detail.

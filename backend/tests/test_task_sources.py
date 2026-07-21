@@ -113,3 +113,26 @@ def test_task_starts_read_only_and_permission_changes_in_conversation(tmp_path: 
         assert client.get(f"/api/tasks/{response.json()['id']}").json()["permission_mode"] == "workspace-write"
     finally:
         remove_workspace_by_path(repo)
+
+
+def test_task_configuration_updates_and_deletion_remove_task_data(tmp_path: Path) -> None:
+    repo = tmp_path / "managed-task-repo"
+    init_clean_repo(repo)
+    try:
+        created = client.post("/api/tasks", json={
+            "source_type": "local", "local_path": str(repo), "title": "原始任务", "requirement": "原始需求",
+        })
+        assert created.status_code == 201
+        task = created.json()
+        updated = client.patch(f"/api/tasks/{task['id']}", json={
+            "title": "已配置任务", "permission_mode": "workspace-write",
+        })
+        assert updated.status_code == 200
+        assert updated.json()["title"] == "已配置任务"
+        assert updated.json()["requirement"] == "原始需求"
+        assert updated.json()["permission_mode"] == "workspace-write"
+        deleted = client.delete(f"/api/tasks/{task['id']}")
+        assert deleted.status_code == 204
+        assert client.get(f"/api/tasks/{task['id']}").status_code == 404
+    finally:
+        remove_workspace_by_path(repo)

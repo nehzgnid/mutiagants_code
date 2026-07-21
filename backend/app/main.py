@@ -435,6 +435,11 @@ class PermissionInput(BaseModel):
     permission_mode: str = Field(pattern="^(read-only|workspace-write|full-access)$")
 
 
+class TaskUpdateInput(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    permission_mode: str = Field(pattern="^(read-only|workspace-write|full-access)$")
+
+
 class MessageInput(BaseModel):
     content: str = Field(min_length=1, max_length=20000)
 
@@ -497,7 +502,7 @@ class ProviderInput(BaseModel):
 
 
 app = FastAPI(title="Local Agent Workbench", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:8787", "http://localhost:8787"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173", "http://127.0.0.1:8787", "http://localhost:8787"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/api/health")
@@ -623,6 +628,29 @@ def update_task_permission(task_id: str, payload: PermissionInput) -> dict[str, 
         task.updated_at = now()
         db.commit()
         return dump_task(task)
+
+
+@app.patch("/api/tasks/{task_id}")
+def update_task(task_id: str, payload: TaskUpdateInput) -> dict[str, Any]:
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+        task.title = payload.title.strip()
+        task.permission_mode = payload.permission_mode
+        task.updated_at = now()
+        db.commit()
+        return dump_task(task)
+
+
+@app.delete("/api/tasks/{task_id}", status_code=204)
+def delete_task(task_id: str) -> None:
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+        db.delete(task)
+        db.commit()
 
 
 @app.get("/api/tasks/{task_id}/messages")

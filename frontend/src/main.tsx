@@ -10,10 +10,13 @@ import {
   GitBranch,
   Globe2,
   Plus,
+  MoreHorizontal,
+  Pencil,
   Send,
   Settings2,
   Shield,
   TerminalSquare,
+  Trash2,
   X,
 } from "lucide-react";
 import { createRoot } from "react-dom/client";
@@ -31,6 +34,7 @@ type TaskMessage = {
 type Task = {
   id: string;
   title: string;
+  requirement: string;
   permission_mode: PermissionMode;
   status: string;
   current_stage: string;
@@ -98,6 +102,8 @@ function App() {
     [compressing, setCompressing] = useState(false),
     [notice, setNotice] = useState(""),
     [showTask, setShowTask] = useState(false),
+    [taskConfig, setTaskConfig] = useState<Task | null>(null),
+    [taskMenu, setTaskMenu] = useState<string | null>(null),
     [showProviders, setShowProviders] = useState(false),
     [showModels, setShowModels] = useState(false),
     [showPermissions, setShowPermissions] = useState(false);
@@ -180,6 +186,19 @@ function App() {
       );
       setShowPermissions(false);
       composerRef.current?.focus();
+    } catch (error) {
+      setNotice(String(error).replace(/^Error: /, ""));
+    }
+  };
+  const deleteTask = async (task: Task) => {
+    if (!window.confirm(`删除“${task.title}”及其所有对话记录？此操作无法撤销。`)) {
+      return;
+    }
+    try {
+      await api<void>(`/api/tasks/${task.id}`, { method: "DELETE" });
+      setTaskMenu(null);
+      setTasks((items) => items.filter((item) => item.id !== task.id));
+      if (selected?.id === task.id) setSelected(null);
     } catch (error) {
       setNotice(String(error).replace(/^Error: /, ""));
     }
@@ -399,13 +418,34 @@ function App() {
             </button>
           </div>
           {tasks.map((task) => (
-            <button
-              className={`task ${selected?.id === task.id ? "active" : ""}`}
+            <div
+              className={`task-row ${selected?.id === task.id ? "active" : ""}`}
               key={task.id}
-              onClick={() => setSelected(task)}
             >
-              <span>{task.title}</span>
-            </button>
+              <button className="task" onClick={() => setSelected(task)}>
+                <span>{task.title}</span>
+              </button>
+              <button
+                type="button"
+                className="task-menu-button"
+                title={`配置任务：${task.title}`}
+                aria-label={`配置任务：${task.title}`}
+                aria-expanded={taskMenu === task.id}
+                onClick={() => setTaskMenu((open) => (open === task.id ? null : task.id))}
+              >
+                <MoreHorizontal size={16} />
+              </button>
+              {taskMenu === task.id && (
+                <div className="task-menu">
+                  <button type="button" onClick={() => { setTaskConfig(task); setTaskMenu(null); }}>
+                    <Pencil size={15} /> 更改配置
+                  </button>
+                  <button type="button" className="danger" onClick={() => void deleteTask(task)}>
+                    <Trash2 size={15} /> 删除任务
+                  </button>
+                </div>
+              )}
+            </div>
           ))}
         </aside>
         <section className="workbench">
@@ -599,6 +639,17 @@ function App() {
             setShowTask(false);
             setSelected(task);
             void load();
+          }}
+        />
+      )}
+      {taskConfig && (
+        <TaskConfigModal
+          task={taskConfig}
+          onClose={() => setTaskConfig(null)}
+          onUpdated={(task) => {
+            setTasks((items) => items.map((item) => (item.id === task.id ? task : item)));
+            if (selected?.id === task.id) setSelected(task);
+            setTaskConfig(null);
           }}
         />
       )}
@@ -917,6 +968,58 @@ function TaskModal({
             取消
           </button>
           <button className="primary">创建任务</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function TaskConfigModal({
+  task,
+  onClose,
+  onUpdated,
+}: {
+  task: Task;
+  onClose: () => void;
+  onUpdated: (task: Task) => void;
+}) {
+  const [title, setTitle] = useState(task.title);
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>(task.permission_mode);
+  const [error, setError] = useState("");
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    try {
+      onUpdated(await api<Task>(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title, permission_mode: permissionMode }),
+      }));
+    } catch (reason) {
+      setError(String(reason).replace(/^Error: /, ""));
+    }
+  };
+  return (
+    <div className="modal-back">
+      <form className="modal task-config-modal" onSubmit={submit}>
+        <div className="modal-heading">
+          <h2>任务配置</h2>
+          <button type="button" title="关闭" onClick={onClose}><X size={17} /></button>
+        </div>
+        <label>
+          任务标题
+          <input required value={title} onChange={(event) => setTitle(event.target.value)} />
+        </label>
+        <label>
+          Agent 权限
+          <select value={permissionMode} onChange={(event) => setPermissionMode(event.target.value as PermissionMode)}>
+            {(Object.keys(permissionLabels) as PermissionMode[]).map((mode) => (
+              <option key={mode} value={mode}>{permissionLabels[mode]}</option>
+            ))}
+          </select>
+        </label>
+        {error && <p className="error">{error}</p>}
+        <div className="modal-actions">
+          <button type="button" onClick={onClose}>取消</button>
+          <button className="primary">保存配置</button>
         </div>
       </form>
     </div>
