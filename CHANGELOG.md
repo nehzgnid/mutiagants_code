@@ -847,3 +847,357 @@ Verification: static review of `.gitignore` and `README.md`.
 - No application code changed; unit-test coverage is not applicable. Configuration verification was performed with Git ignore checks.
 
 Verification: `git check-ignore -v` passed for intended generated and sensitive paths.
+
+## 2026-07-21
+
+### Plan
+
+- Requirements analysis: replace keyword-only task routing with a master-agent decision that explicitly classifies task complexity and the required multi-agent workflow.
+- High-level design: use a JSON-only master-agent response as the routing contract, persist the accepted decision on the task, and drive stage transitions from its approved sequence.
+- Detailed design: constrain `task_type`, `workflow`, and the exact allowed `required_stages` sequences with Pydantic validation; retain the deterministic classifier only as a failure fallback so malformed model output cannot block a task.
+
+Verification: reviewed the existing model gateway, routing entry points, stage state machine, SQLite additive migration pattern, and orchestration tests.
+
+### Code
+
+- Added a persisted `routing_decision` task field and additive SQLite migration. Task responses now include the master-agent decision containing `task_type`, `complexity_reason`, `workflow`, and `required_stages`.
+- Added a JSON-only master-agent routing request for the first task message. The service validates the model result against approved stage sequences before assigning agents and advancing the workflow; invalid JSON, invalid stage sequences, and model failures use a recorded deterministic fallback.
+- Updated stage advancement to use the approved `required_stages` sequence, preserving the existing coding-permission confirmation and acceptance gates.
+
+Verification: `git diff --check` passed.
+
+### Code Review
+
+- Confirmed untrusted model output cannot select arbitrary stage names, skip mandatory review/testing stages, or make a read-only task enter a development workflow.
+- Confirmed routing decisions are persisted before the stage run and that existing direct routing callers retain the deterministic fallback behavior.
+
+Verification: static review of `backend/app/main.py`; `git diff --check` passed.
+
+### Unit Testing
+
+- Added coverage for a valid master-agent JSON decision controlling and persisting a full workflow, and for rejection of an invalid stage contract with deterministic fallback.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 21 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
+
+## 2026-07-21
+
+### Plan
+
+- Requirements analysis: remove deterministic keyword fallback because task classification must be exclusively owned by the master Agent; failed routing must leave the task unstarted and allow an explicit user retry.
+- High-level design: make master-agent routing a required precondition before persisting a user message or opening a stage run; report failures through the existing stream activity surface.
+- Detailed design: raise a dedicated routing error for unavailable, malformed, or invalid JSON decisions; return a retryable SSE error for streaming chat and HTTP 502 for the non-stream endpoint; retain the original draft in a retry action.
+
+Verification: reviewed the message persistence order, stage creation path, streamed error renderer, and existing retry-safe composer state.
+
+### Code
+
+- Removed the keyword classifier and all fallback route generation. The master Agent is now the sole source of a task routing decision.
+- Added routing-failure handling that prevents user-message persistence and stage creation. Streaming requests emit the exact failure reason with a retryable flag; non-stream requests return HTTP 502.
+- Added a visible `重试主 Agent 判定` action to failed conversation runs, using the original task input for a new routing attempt.
+
+Verification: `git diff --check` passed; `npm --prefix frontend run build` passed.
+
+### Code Review
+
+- Confirmed model transport errors, non-JSON output, and invalid stage contracts leave `workflow_type` unclassified and do not create a message or stage run.
+- Confirmed retrying does not bypass the master Agent, and only a validated decision can begin the orchestrated workflow.
+
+Verification: static review of `backend/app/main.py` and `frontend/src/main.tsx`; `git diff --check` passed.
+
+### Unit Testing
+
+- Updated model conversation fixtures for the required master-agent routing call and added API coverage proving a failed route persists neither messages nor stage runs.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 22 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
+
+## 2026-07-21
+
+### Plan
+
+- Requirements analysis: add a task-scoped execution mode with a safe default. Plan mode must stop only before coding, automatic mode must pass that gate, and neither mode may alter a task once coding has begun.
+- High-level design: persist `execution_mode` on `Task`, expose it in task responses and task configuration, and calculate a server-authoritative lock from the development workflow stage.
+- Detailed design: use `confirm_before_coding` and `automatic` as the only accepted values; apply the mode in `next_stage` whenever the following stage is `编码实现`; expose a compact composer control next to the permission selector and reject late changes through both update endpoints.
+
+Verification: reviewed the existing SQLite additive migration, approved workflow sequences, confirmation gate, composer control layout, and task configuration API.
+
+### Code
+
+- Added persistent `execution_mode` storage with an additive SQLite migration; new tasks default to `confirm_before_coding` and task payloads now include the selected mode plus an `execution_mode_locked` flag.
+- Added `PATCH /api/tasks/{task_id}/execution-mode` and task-configuration support for changing the mode before coding. Existing task-update clients may omit the new field.
+- Updated stage advancement so plan mode enters `待编码确认` before implementation, while automatic mode advances directly to `编码实现`; existing implementation-to-review-to-test-to-acceptance transitions remain uninterrupted.
+- Added the two-state execution-mode picker beside the composer permission button and a task-configuration selector. Both controls are disabled after coding begins.
+
+Verification: `git diff --check` passed; `npm --prefix frontend run build` passed.
+
+### Code Review
+
+- Confirmed validation restricts persisted values to the two supported modes and that the server, rather than the disabled frontend control, enforces the post-coding lock.
+- Confirmed read-only workflows still finish at `已完成`, simple workflows can bypass design stages, and full workflows retain requirements, overview, and detailed design before the coding decision point.
+
+Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, and `frontend/src/styles.css`.
+
+### Unit Testing
+
+- Added coverage for the plan-mode default, automatic full-workflow progression from detailed design through acceptance, and rejection of a mode update after coding starts.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 23 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
+
+## 2026-07-21
+
+### Plan
+
+- Requirements analysis, high-level design, and detailed design: introduce local `stdio` MCP Server connectivity as an application capability while retaining task-scoped authorization and existing workflow permission gates.
+
+Verification: inspected the existing tool dispatch, task configuration, model function-call routes, and Python MCP SDK client interfaces.
+
+### Code
+
+- Added local MCP Server discovery and invocation, persisted server profiles, task-level tool grants, model function-schema adaptation, and server-side read/write/full-access enforcement.
+
+Verification: a test MCP stdio process completed discovery and `tools/call` through the application; `git diff --check` passed.
+
+### Documentation
+
+- Updated README with local MCP setup, task authorization, permission behavior, local-environment secret handling, and the first-version `stdio` transport boundary.
+
+Verification: documentation checked against the implemented API and access-policy paths.
+
+### Code Review
+
+- Confirmed MCP configuration cannot bypass task authorization, workflow stage checks, or task permission; commands and argument arrays are not shell-concatenated.
+
+Verification: static review of backend routing, UI configuration, and MCP-focused tests.
+
+### Unit Testing
+
+- Added real stdio MCP coverage for discovery, call routing, duplicate and unavailable server handling, access classes, and UI configuration contracts.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 26 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
+
+## 2026-07-21
+
+### Plan
+
+- Requirements analysis: fix the conversation view so completed Agent work is not rendered a second time after all message history, which separated user instructions from their replies.
+- High-level design: treat streamed work output as temporary UI state and use persisted task messages as the sole completed conversation timeline.
+- Detailed design: after a stream completes and `refreshTaskWorkflow` loads the persisted user and assistant messages in timestamp order, remove that run by its client-side `runId`; failed runs remain visible with their retry action.
+
+Verification: traced the message-list rendering and confirmed that `messages` and completed `runs` were rendered as two consecutive groups.
+
+### Code
+
+- Removed completed streaming runs after their persisted history refresh, preventing duplicate, out-of-order Agent output in the conversation view.
+
+Verification: reviewed the post-stream lifecycle in `frontend/src/main.tsx`.
+
+### Code Review
+
+- Confirmed only successful completed runs are removed; errors remain available for retry and no server-side task history is changed.
+
+Verification: static review of the stream completion and error paths.
+
+### Unit Testing
+
+- Added a frontend rendering contract requiring completed streaming runs to be removed after history refresh.
+
+Verification: focused frontend pytest passed with 4 tests; full backend suite, frontend production build, and `git diff --check` are pending final execution.
+
+## 2026-07-21
+
+### Plan
+
+- Requirements analysis: fix the conversation view so completed Agent work is not rendered a second time after all message history, which separated user instructions from their replies.
+- High-level design: treat streamed work output as temporary UI state and use persisted task messages as the sole completed conversation timeline.
+- Detailed design: after a stream completes and `refreshTaskWorkflow` loads the persisted user and assistant messages in timestamp order, remove that run by its client-side `runId`; failed runs remain visible with their retry action.
+
+Verification: traced the message-list rendering and confirmed that `messages` and completed `runs` were rendered as two consecutive groups.
+
+### Code
+
+- Removed completed streaming runs after their persisted history refresh, preventing duplicate, out-of-order Agent output in the conversation view.
+
+Verification: reviewed the post-stream lifecycle in `frontend/src/main.tsx`.
+
+### Code Review
+
+- Confirmed only successful completed runs are removed; errors remain available for retry and no server-side task history is changed.
+
+Verification: static review of the stream completion and error paths.
+
+### Unit Testing
+
+- Added a frontend rendering contract requiring completed streaming runs to be removed after history refresh.
+
+Verification: pending focused and full test execution.
+
+## 2026-07-21
+
+### Plan
+
+- Requirements analysis: clarify that the conversation is chronological, but earlier failed or interrupted requests may have no persisted Agent response, making consecutive user instructions appear together.
+- High-level design: retain chronological history while visually separating every Agent response from adjacent replies and the activity trace.
+- Detailed design: apply one shared assistant-message container style to both persisted replies and streamed `RunOutput` entries, using a border, restrained surface, and existing spacing without changing message data or ordering.
+
+Verification: compared the reported task's persisted `task_messages` timestamps and roles with the rendered message-list implementation.
+
+### Code
+
+- Added a distinct visual container for Agent messages and streaming work output so successive Agent replies no longer visually merge into one continuous white page.
+- Updated the conversation request test to require the built-in read-only tools while allowing globally enabled MCP tools, matching the shared MCP Server configuration model.
+
+Verification: frontend source reviewed for shared `.message.assistant` application to persisted and streamed messages.
+
+### Code Review
+
+- Confirmed the change is presentation-only: it does not reorder messages, hide failed requests, or alter task history and streaming state.
+
+Verification: reviewed `frontend/src/main.tsx` and the assistant-message CSS selector.
+
+### Unit Testing
+
+- Extended the frontend rendering contract to require a dedicated assistant message container and visual boundary.
+
+Verification: focused frontend pytest passed with 3 tests; full backend suite passed with 28 tests and 1 existing Starlette deprecation warning; frontend production build and `git diff --check` passed.
+
+## 2026-07-21
+
+### Plan
+
+- Requirements analysis: change MCP ownership from task-scoped grants to global enabled Server profiles that every task can reuse; provide a one-click bundled coding MCP Server.
+- High-level design: discover tools once per global Server profile, expose enabled tools to every task subject to that task's stage and permission checks, and start the bundled Server with the current task workspace supplied only by the host process.
+- Detailed design: classify bundled list/read tools as read-only and write tools as workspace-write; reject absolute paths, traversal outside the resolved workspace, and excluded directories inside the bundled Server.
+
+Verification: reviewed existing MCP persistence, model function-schema generation, task-stage gates, and stdio lifecycle before changing the routing model.
+
+### Code
+
+- Added `builtin_coding_mcp.py` and `POST /api/mcp-servers/presets/coding`; the MCP Server management dialog now has an “添加预制编码 MCP Server” action which registers it once and makes its tools globally available.
+- Changed MCP tool discovery, model schema exposure, dispatch, and streamed activity lookup to use all enabled Server profiles rather than per-task authorization records. Existing task grants no longer control availability.
+- Passed the current task worktree to bundled MCP calls through `LOCAL_AGENT_WORKSPACE`; the bundled Server constrains list, read, and write operations to that workspace and preserves write-stage/task-permission enforcement in the application backend.
+- Preserved tool access classifications on Server update and diagnosis. Third-party MCP tools default to read-only when no classification is present.
+
+Verification: `git diff --check` passed; focused tests verified a real bundled stdio Server discovers its tools and writes only after the task enters an allowed coding stage.
+
+### Documentation
+
+- Updated README to document global MCP Server reuse, the prebuilt coding Server, automatic tool use, and its workspace boundary and write restrictions.
+
+Verification: documentation reviewed against the MCP route, adapter environment injection, and bundled Server implementation.
+
+### Code Review
+
+- Confirmed that global Server reuse does not make write tools globally writable: `tools_for_task` filters by the current task before the model sees a function, and `execute_tool` repeats the same check immediately before `tools/call`.
+- Confirmed the bundled Server does not accept a model-provided root directory and resolves every relative path against the host-provided task worktree.
+- Confirmed re-diagnosing a Server retains access classification and that deleting or disabling a Server removes it from all task tool lists.
+
+Verification: static review of `backend/app/main.py`, `backend/app/builtin_coding_mcp.py`, `frontend/src/main.tsx`, and the focused MCP tests.
+
+### Unit Testing
+
+- Updated MCP tests for global Server visibility and added bundled coding Server coverage for discovery, automatic availability, write-stage gating, and workspace-local writes.
+- Updated the frontend contract test to require the prebuilt Server action and absence of per-task MCP authorization UI.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 27 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed; `git diff --check` passed.
+
+## 2026-07-21
+
+### Plan
+
+- Requirements analysis: allow the independent web application to connect to separately implemented local MCP Servers through `stdio`, while preserving the existing task workflow and server-authoritative permission model.
+- High-level design: add an MCP client adapter that starts short-lived local server processes for discovery and calls; store server profiles in the application and grant discovered tools to individual tasks only.
+- Detailed design: model MCP Server command, argument list, enabled state, and discovered schemas; let each task assign an access class to each selected tool; translate only task-authorized and stage-permitted tools into model function schemas, then resolve tool calls back to MCP `tools/call`.
+
+Verification: inspected the existing tool registry, model function-call loops, task configuration API, workflow-stage permissions, and React configuration modal patterns; installed and inspected the official Python `mcp` SDK `stdio` client API.
+
+### Code
+
+- Added the official `mcp` dependency and a local `stdio` client adapter that initializes an MCP session, discovers tools, invokes tools with bounded timeouts, and closes the child process/session after each operation.
+- Added persisted MCP Server profiles, server CRUD and diagnostic APIs, discovered tool schemas, task-specific MCP tool grants, and cleanup of grants when a server or task is deleted.
+- Added backend conversion from authorized MCP schemas to unique model function names, routing from model tool calls to MCP `tools/call`, and streamed activity entries naming the called MCP Server and tool.
+- Enforced access classes server-side: read-only tools are available when granted, workspace-write tools require the existing writable execution stage and task permission, and full-access tools require full task access.
+- Added UI configuration for local `stdio` MCP Servers and task-level tool selection with a per-tool access class; updated the README with the local-only transport, environment-variable secret handling, and permission behavior.
+
+Verification: `git diff --check` passed; a real test MCP stdio process successfully completed initialization, tool discovery, schema conversion, and `tools/call` through the application adapter.
+
+### Code Review
+
+- Confirmed command and arguments are passed to the SDK as separate values rather than through shell concatenation, and MCP Server environment variables are inherited from the host process rather than persisted in the database.
+- Confirmed an MCP Server profile or frontend access-class selection does not grant execution by itself: task authorization, current workflow stage, and task permission are all checked immediately before the MCP call.
+- Confirmed unknown, disabled, stale, duplicate, and unauthorized MCP tools are rejected before a model tool call can reach a server.
+
+Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, `README.md`, and MCP-focused tests; `git diff --check` passed.
+
+### Unit Testing
+
+- Added a real local `stdio` MCP test server to cover discovery, duplicate server rejection, task authorization isolation, model function schema mapping, tool-call response handling, write-stage gating, full-access gating, unavailable commands, and server cleanup.
+- Added frontend configuration-contract coverage for MCP server management and task tool authorization controls.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 26 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
+
+## 2026-07-21
+
+### Plan
+
+- Requirements analysis: restore the visible identity of persisted user messages and explain why a task cannot modify documentation or source files when file-write capability is unavailable.
+- High-level design: render a role label for both conversation participants and expose a server-authoritative file-write status derived from the task permission and workflow stage.
+- Detailed design: make `write_enabled` true only for `编码实现` and `修复` with `工作区读写` or `完全访问`; show that status beside the task title, retain the existing permission selector and coding-confirmation gate, and document that the current tools are local function calls rather than an implemented MCP Server.
+
+Verification: reviewed message rendering, task serialization, workflow-stage transitions, tool selection, and current MCP planning documentation.
+
+### Code
+
+- Restored the `你` role label for every persisted user message while preserving the existing `Agent` label and Markdown rendering for assistant messages.
+- Added a server-calculated `write_enabled` task property and a visible task status that distinguishes writable execution stages from read-only or pre-confirmation stages. The local `write_file` tool remains unavailable until both the execution-stage and permission checks pass.
+
+Verification: `git diff --check` passed; `npm --prefix frontend run build` passed.
+
+### Documentation
+
+- Added README documentation describing the exact file-write preconditions and clarifying that the current implementation uses controlled local function tools, not an MCP Server connection.
+
+Verification: reviewed the README statement against `tools_for_task`, `write_enabled`, and the registered local tool definitions in `backend/app/main.py`.
+
+### Code Review
+
+- Confirmed the frontend write-status indicator is informational only; the backend continues to decide whether `write_file` is sent to the model from the current stage and persisted permission.
+- Confirmed user-message labels apply equally to newly submitted and reloaded history entries, and that write access is not exposed during analysis, design, confirmation, acceptance, or completed stages.
+
+Verification: static review of `frontend/src/main.tsx`, `backend/app/main.py`, `README.md`, and focused tests; `git diff --check` passed.
+
+### Unit Testing
+
+- Updated the frontend rendering contract for user labels and extended orchestration coverage to assert that `write_file` appears only once a writable task enters the implementation stage.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 23 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
+
+## 2026-07-21
+
+### Plan
+
+- Requirements analysis, high-level design, and detailed design: introduce local `stdio` MCP Server connectivity as an application capability while retaining task-scoped authorization and existing workflow permission gates.
+
+Verification: inspected the existing tool dispatch, task configuration, model function-call routes, and Python MCP SDK client interfaces.
+
+### Code
+
+- Added local MCP Server discovery and invocation, persisted server profiles, task-level tool grants, model function-schema adaptation, and server-side read/write/full-access enforcement.
+
+Verification: a test MCP stdio process completed discovery and `tools/call` through the application; `git diff --check` passed.
+
+### Documentation
+
+- Updated README with local MCP setup, task authorization, permission behavior, local-environment secret handling, and the first-version `stdio` transport boundary.
+
+Verification: documentation checked against the implemented API and access-policy paths.
+
+### Code Review
+
+- Confirmed MCP configuration cannot bypass task authorization, workflow stage checks, or task permission; commands and argument arrays are not shell-concatenated.
+
+Verification: static review of backend routing, UI configuration, and MCP-focused tests.
+
+### Unit Testing
+
+- Added real stdio MCP coverage for discovery, call routing, duplicate and unavailable server handling, access classes, and UI configuration contracts.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 26 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.

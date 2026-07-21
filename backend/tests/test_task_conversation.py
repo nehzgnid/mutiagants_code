@@ -40,10 +40,14 @@ def test_task_conversation_persists_history_and_sends_context(monkeypatch, tmp_p
     }).json()
     assert client.post(f"/api/model-providers/{provider['id']}/activate").status_code == 200
     captured: dict = {}
+    responses = iter([
+        '{"task_type":"development","complexity_reason":"需要设计方案。","workflow":"full","required_stages":["需求分析","概要设计","详细设计","编码实现","代码审核","单元测试"]}',
+        "已记录，会继续推进设计。",
+    ])
 
     class Response:
         def raise_for_status(self) -> None: pass
-        def json(self) -> dict: return {"choices": [{"message": {"content": "已记录，会继续推进设计。"}}]}
+        def json(self) -> dict: return {"choices": [{"message": {"content": next(responses)}}]}
 
     def fake_post(*args, **kwargs):
         captured.update(kwargs["json"])
@@ -58,7 +62,8 @@ def test_task_conversation_persists_history_and_sends_context(monkeypatch, tmp_p
         reply = client.post(f"/api/tasks/{task_id}/messages", json={"content": "请先给出概要设计。"})
         assert reply.status_code == 201
         assert reply.json()["role"] == "assistant"
-        assert {tool["function"]["name"] for tool in captured["tools"]} == {"list_files", "read_file"}
+        tool_names = {tool["function"]["name"] for tool in captured["tools"]}
+        assert {"list_files", "read_file"}.issubset(tool_names)
         history = client.get(f"/api/tasks/{task_id}/messages").json()
         assert [item["role"] for item in history] == ["user", "assistant"]
         assert captured["messages"][-1] == {"role": "user", "content": "请先给出概要设计。"}
@@ -91,6 +96,7 @@ def test_context_usage_and_model_compression_keep_chat_history(monkeypatch, tmp_
         "name": f"context-{uuid.uuid4().hex}", "kind": "external", "base_url": "https://example.test/v1", "model_name": "test-model",
     }).json()
     assert client.post(f"/api/model-providers/{provider['id']}/activate").status_code == 200
+
     captured: dict = {}
 
     class SummaryResponse:
@@ -151,6 +157,11 @@ def test_streamed_conversation_emits_activity_tokens_and_completion(monkeypatch,
     }).json()
     assert client.post(f"/api/model-providers/{provider['id']}/activate").status_code == 200
 
+    class RoutingResponse:
+        def raise_for_status(self) -> None: pass
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": '{"task_type":"development","complexity_reason":"普通实现任务。","workflow":"simple","required_stages":["需求分析","编码实现","代码审核","单元测试"]}'}}]}
+
     class StreamResponse:
         def __enter__(self): return self
         def __exit__(self, *args): return None
@@ -163,6 +174,7 @@ def test_streamed_conversation_emits_activity_tokens_and_completion(monkeypatch,
                 "data: [DONE]",
             ])
 
+    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: RoutingResponse())
     monkeypatch.setattr(main.httpx, "stream", lambda *args, **kwargs: StreamResponse())
     task = client.post("/api/tasks", json={"source_type": "local", "local_path": str(repo), "title": f"stream-{uuid.uuid4().hex}"}).json()
     try:

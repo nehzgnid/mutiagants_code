@@ -4,15 +4,20 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import uuid
+import asyncio
+import hashlib
 from math import ceil
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -56,11 +61,13 @@ class Task(Base):
     current_stage: Mapped[str] = mapped_column(String)
     worktree_path: Mapped[str | None] = mapped_column(String, nullable=True)
     permission_mode: Mapped[str] = mapped_column(String, default="read-only")
+    execution_mode: Mapped[str] = mapped_column(String, default="confirm_before_coding")
     workflow_type: Mapped[str] = mapped_column(String, default="unclassified")
     task_kind: Mapped[str] = mapped_column(String, default="unclassified")
     assigned_agent: Mapped[str] = mapped_column(String, default="主 Agent")
     branch: Mapped[str | None] = mapped_column(String, nullable=True)
     artifacts: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    routing_decision: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     context_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -105,6 +112,27 @@ class ModelProvider(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class McpServer(Base):
+    __tablename__ = "mcp_servers"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, unique=True)
+    command: Mapped[str] = mapped_column(String)
+    arguments: Mapped[list[str]] = mapped_column(JSON, default=list)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    tools: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class TaskMcpTool(Base):
+    __tablename__ = "task_mcp_tools"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id"))
+    server_id: Mapped[str] = mapped_column(ForeignKey("mcp_servers.id"))
+    tool_name: Mapped[str] = mapped_column(String)
+    access_mode: Mapped[str] = mapped_column(String)
+
+
 Base.metadata.create_all(engine)
 
 
@@ -116,11 +144,17 @@ def migrate_schema() -> None:
             connection.exec_driver_sql(
                 "ALTER TABLE tasks ADD COLUMN permission_mode VARCHAR NOT NULL DEFAULT 'read-only'"
             )
+        if "execution_mode" not in columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE tasks ADD COLUMN execution_mode VARCHAR NOT NULL DEFAULT 'confirm_before_coding'"
+            )
         for name, default in (("workflow_type", "unclassified"), ("task_kind", "unclassified"), ("assigned_agent", "主 Agent")):
             if name not in columns:
                 connection.exec_driver_sql(f"ALTER TABLE tasks ADD COLUMN {name} VARCHAR NOT NULL DEFAULT '{default}'")
         if "context_summary" not in columns:
             connection.exec_driver_sql("ALTER TABLE tasks ADD COLUMN context_summary TEXT")
+        if "routing_decision" not in columns:
+            connection.exec_driver_sql("ALTER TABLE tasks ADD COLUMN routing_decision JSON")
     message_columns = {column["name"] for column in inspect(engine).get_columns("task_messages")}
     if "context_compacted" not in message_columns:
         with engine.begin() as connection:
@@ -138,9 +172,13 @@ def dump_task(item: Task) -> dict[str, Any]:
     payload = {"id": item.id, "title": item.title,
                "requirement": item.requirement,
                "permission_mode": item.permission_mode,
+               "write_enabled": write_enabled(item),
+               "execution_mode": item.execution_mode,
+               "execution_mode_locked": execution_mode_locked(item),
                "status": item.status, "current_stage": item.current_stage,
                "workflow_type": item.workflow_type, "task_kind": item.task_kind,
                "assigned_agent": item.assigned_agent,
+               "routing_decision": item.routing_decision,
                "created_at": item.created_at.isoformat(), "updated_at": item.updated_at.isoformat()}
     return payload
 
@@ -168,38 +206,120 @@ FIXING_STAGE = "修复"
 AWAIT_ACCEPTANCE_STAGE = "待用户验收"
 COMPLETED_STAGE = "已完成"
 
+
+def execution_mode_locked(task: Task) -> bool:
+    """Execution mode is immutable from the first implementation stage onward."""
+    return task.workflow_type in {"simple", "full"} and task.current_stage in {
+        IMPLEMENTATION_STAGE, CODE_REVIEW_STAGE, UNIT_TESTING_STAGE, FIXING_STAGE,
+        AWAIT_ACCEPTANCE_STAGE, COMPLETED_STAGE,
+    }
+
+
+def write_enabled(task: Task) -> bool:
+    """Report whether the current workflow stage exposes the local write tool."""
+    return task.permission_mode in {"workspace-write", "full-access"} and task.current_stage in {
+        IMPLEMENTATION_STAGE,
+        FIXING_STAGE,
+    }
+
 STAGE_AGENTS = {
     READ_ONLY_STAGE: "阅读 Agent", REQUIREMENTS_STAGE: "主 Agent", HIGH_LEVEL_DESIGN_STAGE: "阅读 Agent",
     DETAILED_DESIGN_STAGE: "阅读 Agent", IMPLEMENTATION_STAGE: "执行 Agent", CODE_REVIEW_STAGE: "审查 Agent",
     UNIT_TESTING_STAGE: "测试 Agent", FIXING_STAGE: "执行 Agent",
 }
-DEVELOPMENT_KEYWORDS = ("修改", "实现", "新增", "添加", "修复", "重构", "开发", "代码", "接口", "功能", "测试", "bug", "缺陷", "优化")
-COMPLEXITY_KEYWORDS = ("多文件", "多个文件", "接口", "数据库", "迁移", "架构", "跨模块", "权限", "安全", "重构", "多个", "前后端")
-READ_ONLY_KEYWORDS = ("分析", "阅读", "查看", "解释", "说明", "为什么", "如何工作", "依赖", "梳理", "报错原因")
 CONFIRMATION_KEYWORDS = ("确认", "继续", "执行", "开始编码", "开始实现", "同意")
 
 
-def classify_workflow(content: str) -> tuple[str, str, str]:
-    """Make routing deterministic so identical requests always receive the same safety boundary."""
-    lowered = content.lower()
-    asks_for_development = any(keyword in lowered for keyword in DEVELOPMENT_KEYWORDS)
-    asks_for_reading = any(keyword in lowered for keyword in READ_ONLY_KEYWORDS)
-    if asks_for_reading and not asks_for_development:
-        return "read_only", "read_only_analysis", READ_ONLY_STAGE
-    if any(keyword in lowered for keyword in COMPLEXITY_KEYWORDS):
-        return "full", "development", REQUIREMENTS_STAGE
-    return "simple", "development", REQUIREMENTS_STAGE
+class RoutingDecision(BaseModel):
+    """The validated contract between the master agent and the stage orchestrator."""
+    task_type: Literal["read_only_analysis", "development"]
+    complexity_reason: str = Field(min_length=1, max_length=500)
+    workflow: Literal["read_only", "simple", "full"]
+    required_stages: list[str] = Field(min_length=1, max_length=6)
+
+
+WORKFLOW_STAGES = {
+    "read_only": [READ_ONLY_STAGE],
+    "simple": [REQUIREMENTS_STAGE, IMPLEMENTATION_STAGE, CODE_REVIEW_STAGE, UNIT_TESTING_STAGE],
+    "full": [REQUIREMENTS_STAGE, HIGH_LEVEL_DESIGN_STAGE, DETAILED_DESIGN_STAGE, IMPLEMENTATION_STAGE, CODE_REVIEW_STAGE, UNIT_TESTING_STAGE],
+}
+
+
+def validate_routing_decision(payload: Any) -> RoutingDecision:
+    decision = RoutingDecision.model_validate(payload)
+    if decision.required_stages != WORKFLOW_STAGES[decision.workflow]:
+        raise ValueError("required_stages must match the approved sequence for the selected workflow.")
+    if (decision.workflow == "read_only") != (decision.task_type == "read_only_analysis"):
+        raise ValueError("task_type and workflow must describe the same task category.")
+    return decision
+
+
+class RoutingError(Exception):
+    """The master agent did not produce a safe routing decision."""
+
+
+def master_agent_route(provider: ModelProvider, task: Task, content: str) -> RoutingDecision:
+    """Ask the master agent for a JSON-only routing decision, then enforce its contract locally."""
+    contract = {
+        "task_type": "read_only_analysis | development",
+        "complexity_reason": "non-empty concise Chinese reason",
+        "workflow": "read_only | simple | full",
+        "required_stages": "exact approved stage sequence for workflow",
+    }
+    prompt = (
+        "You are the master agent that routes a local coding task. Return only one JSON object, with no Markdown. "
+        f"Its exact keys and constraints are: {json.dumps(contract, ensure_ascii=False)}. "
+        f"Approved sequences: {json.dumps(WORKFLOW_STAGES, ensure_ascii=False)}. "
+        "Use read_only only for requests that do not ask for a change. Use full when cross-module, security, architecture, "
+        "data migration, or multi-file coordination needs explicit design stages; otherwise use simple. "
+        f"Task title: {task.title}\nTask requirement: {task.requirement}\nIncoming message: {content}"
+    )
+    try:
+        response = httpx.post(
+            f"{api_root(provider.base_url)}/chat/completions",
+            json={"model": provider.model_name, "temperature": 0, "messages": [
+                {"role": "system", "content": "Return valid JSON only. Do not call tools."},
+                {"role": "user", "content": prompt},
+            ]},
+            headers={"Authorization": f"Bearer {read_secrets().get(provider.id, '')}"}, timeout=30,
+        )
+        response.raise_for_status()
+        raw = response.json()["choices"][0]["message"]["content"]
+        if not isinstance(raw, str):
+            raise ValueError("The master agent did not return JSON text.")
+        return validate_routing_decision(json.loads(raw))
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RoutingError(f"主 Agent 路由失败：{type(error).__name__}: {error}") from error
+
+
+def apply_routing_decision(task: Task, decision: RoutingDecision) -> str:
+    task.workflow_type = decision.workflow
+    task.task_kind = decision.task_type
+    task.routing_decision = decision.model_dump()
+    return decision.required_stages[0]
 
 
 def next_stage(task: Task, completed_stage: str) -> str:
+    decision = task.routing_decision or {}
+    required_stages = decision.get("required_stages") if isinstance(decision, dict) else None
+    if isinstance(required_stages, list) and completed_stage in required_stages:
+        position = required_stages.index(completed_stage)
+        if position + 1 < len(required_stages):
+            following = required_stages[position + 1]
+            if following == IMPLEMENTATION_STAGE and task.execution_mode != "automatic":
+                return AWAIT_CODING_APPROVAL_STAGE
+            return following
+        return COMPLETED_STAGE if task.workflow_type == "read_only" else AWAIT_ACCEPTANCE_STAGE
     if task.workflow_type == "read_only":
         return COMPLETED_STAGE
     if completed_stage == REQUIREMENTS_STAGE:
-        return HIGH_LEVEL_DESIGN_STAGE if task.workflow_type == "full" else AWAIT_CODING_APPROVAL_STAGE
+        if task.workflow_type == "full":
+            return HIGH_LEVEL_DESIGN_STAGE
+        return IMPLEMENTATION_STAGE if task.execution_mode == "automatic" else AWAIT_CODING_APPROVAL_STAGE
     if completed_stage == HIGH_LEVEL_DESIGN_STAGE:
         return DETAILED_DESIGN_STAGE
     if completed_stage == DETAILED_DESIGN_STAGE:
-        return AWAIT_CODING_APPROVAL_STAGE
+        return IMPLEMENTATION_STAGE if task.execution_mode == "automatic" else AWAIT_CODING_APPROVAL_STAGE
     if completed_stage == IMPLEMENTATION_STAGE:
         return CODE_REVIEW_STAGE
     if completed_stage == CODE_REVIEW_STAGE:
@@ -223,7 +343,7 @@ def start_stage(db: Session, task: Task, stage: str, content: str) -> StageRun:
     return run
 
 
-def route_message(db: Session, task: Task, content: str) -> StageRun | None:
+def route_message(db: Session, task: Task, content: str, decision: RoutingDecision | None = None) -> StageRun | None:
     if task.current_stage in {AWAIT_CODING_APPROVAL_STAGE, AWAIT_ACCEPTANCE_STAGE}:
         if not any(keyword in content.lower() for keyword in CONFIRMATION_KEYWORDS):
             return None
@@ -233,11 +353,12 @@ def route_message(db: Session, task: Task, content: str) -> StageRun | None:
             return start_stage(db, task, IMPLEMENTATION_STAGE, content)
         task.current_stage, task.status, task.assigned_agent, task.updated_at = COMPLETED_STAGE, "completed", "主 Agent", now()
         return None
-    if task.workflow_type != "unclassified" and task.current_stage != COMPLETED_STAGE:
+    if task.workflow_type not in {None, "unclassified"} and task.current_stage != COMPLETED_STAGE:
         return start_stage(db, task, task.current_stage, content)
     if task.status != "in_progress" or task.current_stage == COMPLETED_STAGE:
-        workflow_type, task_kind, stage = classify_workflow(content)
-        task.workflow_type, task.task_kind = workflow_type, task_kind
+        if not decision:
+            raise RoutingError("主 Agent 路由失败：未提供可验证的路由决策。")
+        stage = apply_routing_decision(task, decision)
         return start_stage(db, task, stage, content)
     return start_stage(db, task, task.current_stage, content)
 
@@ -277,6 +398,82 @@ def dump_provider(item: ModelProvider) -> dict[str, Any]:
     return {"id": item.id, "name": item.name, "kind": item.kind, "base_url": item.base_url,
             "model_name": item.model_name, "is_active": item.is_active,
             "has_api_key": bool(read_secrets().get(item.id)), "created_at": item.created_at.isoformat()}
+
+
+MCP_ACCESS_MODES = {"read-only", "workspace-write", "full-access"}
+MCP_TIMEOUT_SECONDS = 30
+BUILTIN_CODING_MCP_NAME = "预制编码工作区工具"
+BUILTIN_CODING_MCP_SCRIPT = Path(__file__).with_name("builtin_coding_mcp.py")
+BUILTIN_CODING_ACCESS_MODES = {
+    "list_workspace_files": "read-only",
+    "read_workspace_file": "read-only",
+    "write_workspace_file": "workspace-write",
+}
+
+
+def dump_mcp_server(item: McpServer) -> dict[str, Any]:
+    return {
+        "id": item.id, "name": item.name, "command": item.command,
+        "arguments": item.arguments or [], "enabled": item.enabled,
+        "tools": item.tools or [], "created_at": item.created_at.isoformat(),
+        "updated_at": item.updated_at.isoformat(),
+    }
+
+
+def dump_task_mcp_tool(item: TaskMcpTool, server: McpServer) -> dict[str, Any]:
+    tool = next((candidate for candidate in (server.tools or []) if candidate.get("name") == item.tool_name), {})
+    return {"server_id": server.id, "server_name": server.name, "tool_name": item.tool_name,
+            "description": tool.get("description", ""), "input_schema": tool.get("input_schema", {}),
+            "access_mode": item.access_mode, "function_name": mcp_function_name(server, item.tool_name)}
+
+
+def mcp_function_name(server: McpServer, tool_name: str) -> str:
+    safe_name = "".join(character if character.isalnum() else "_" for character in tool_name)
+    tool_hash = hashlib.sha256(tool_name.encode("utf-8")).hexdigest()[:12]
+    return f"mcp_{server.id.replace('-', '')[:8]}_{tool_hash}_{safe_name[:32]}"
+
+
+async def mcp_list_tools_async(server: McpServer) -> list[dict[str, Any]]:
+    parameters = StdioServerParameters(command=server.command, args=list(server.arguments or []), env=dict(os.environ))
+    async with stdio_client(parameters) as (reader, writer):
+        async with ClientSession(reader, writer) as session:
+            await asyncio.wait_for(session.initialize(), timeout=MCP_TIMEOUT_SECONDS)
+            result = await asyncio.wait_for(session.list_tools(), timeout=MCP_TIMEOUT_SECONDS)
+            return [{"name": tool.name, "description": tool.description or "", "input_schema": tool.inputSchema}
+                    for tool in result.tools]
+
+
+async def mcp_call_tool_async(server: McpServer, tool_name: str, arguments: dict[str, Any], environment: dict[str, str] | None = None) -> str:
+    process_environment = dict(os.environ)
+    if environment:
+        process_environment.update(environment)
+    parameters = StdioServerParameters(command=server.command, args=list(server.arguments or []), env=process_environment)
+    async with stdio_client(parameters) as (reader, writer):
+        async with ClientSession(reader, writer) as session:
+            await asyncio.wait_for(session.initialize(), timeout=MCP_TIMEOUT_SECONDS)
+            result = await asyncio.wait_for(
+                session.call_tool(tool_name, arguments, read_timeout_seconds=timedelta(seconds=MCP_TIMEOUT_SECONDS)),
+                timeout=MCP_TIMEOUT_SECONDS,
+            )
+            payload = result.model_dump(mode="json")
+            if payload.get("isError"):
+                raise ValueError(json.dumps(payload, ensure_ascii=False))
+            return json.dumps(payload, ensure_ascii=False)
+
+
+def discover_mcp_tools(server: McpServer) -> list[dict[str, Any]]:
+    try:
+        return asyncio.run(mcp_list_tools_async(server))
+    except (OSError, asyncio.TimeoutError, ValueError) as error:
+        raise ValueError(f"MCP Server 连接或工具发现失败：{error}") from error
+
+
+def classify_mcp_tools(server: McpServer, discovered: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    existing_modes = {str(tool.get("name")): mcp_tool_access_mode(server, tool) for tool in (server.tools or [])}
+    return [{**tool, "access_mode": (
+        BUILTIN_CODING_ACCESS_MODES.get(tool["name"], "read-only")
+        if server.name == BUILTIN_CODING_MCP_NAME else existing_modes.get(tool["name"], "read-only")
+    )} for tool in discovered]
 
 
 def api_root(base_url: str) -> str:
@@ -406,19 +603,83 @@ def tools_for(permission_mode: str) -> list[dict[str, Any]]:
     return tools
 
 
-def tools_for_task(task: Task) -> list[dict[str, Any]]:
-    """A writable task remains read-only until the orchestrator enters an execution stage."""
-    if task.current_stage in {AWAIT_CODING_APPROVAL_STAGE, AWAIT_ACCEPTANCE_STAGE, COMPLETED_STAGE}:
-        return list(BASE_TOOLS)
-    return tools_for(task.permission_mode)
+def mcp_tool_allowed(task: Task, access_mode: str) -> bool:
+    if access_mode == "read-only":
+        return True
+    if access_mode == "workspace-write":
+        return write_enabled(task)
+    return task.permission_mode == "full-access"
 
 
-def execute_tool(task: Task, name: str, arguments: dict[str, Any]) -> str:
+def mcp_tool_access_mode(server: McpServer, tool: dict[str, Any]) -> str:
+    """Unknown third-party tools are read-only unless their profile explicitly classifies them."""
+    configured = tool.get("access_mode")
+    return configured if configured in MCP_ACCESS_MODES else "read-only"
+
+
+def enabled_mcp_servers(db: Session) -> list[McpServer]:
+    return list(db.scalars(select(McpServer).where(McpServer.enabled.is_(True))))
+
+
+def task_mcp_tools(db: Session, task: Task) -> list[tuple[TaskMcpTool, McpServer]]:
+    records = db.scalars(select(TaskMcpTool).where(TaskMcpTool.task_id == task.id)).all()
+    result: list[tuple[TaskMcpTool, McpServer]] = []
+    for record in records:
+        server = db.get(McpServer, record.server_id)
+        if server and server.enabled:
+            result.append((record, server))
+    return result
+
+
+def tools_for_task(task: Task, db: Session | None = None) -> list[dict[str, Any]]:
+    """Expose globally configured MCP tools that satisfy the task access policy."""
+    selected_tools = tools_for(task.permission_mode) if write_enabled(task) else list(BASE_TOOLS)
+    if not db:
+        return selected_tools
+    for server in enabled_mcp_servers(db):
+        for discovered in server.tools or []:
+            if not mcp_tool_allowed(task, mcp_tool_access_mode(server, discovered)):
+                continue
+            tool_name = str(discovered.get("name", ""))
+            if not tool_name:
+                continue
+            selected_tools.append({"type": "function", "function": {
+                "name": mcp_function_name(server, tool_name),
+                "description": f"MCP {server.name}: {discovered.get('description') or tool_name}",
+                "parameters": discovered.get("input_schema") or {"type": "object", "properties": {}},
+            }})
+    return selected_tools
+
+
+def execute_tool(task: Task, name: str, arguments: dict[str, Any], db: Session | None = None) -> str:
     handlers = {"list_files": list_local_files, "read_file": read_local_file, "write_file": write_local_file, "run_command": run_local_command}
     handler = handlers.get(name)
-    if not handler:
+    if handler:
+        return handler(task, arguments)
+    if not db:
         raise ValueError(f"Unsupported tool: {name}")
-    return handler(task, arguments)
+    for server in enabled_mcp_servers(db):
+        for discovered in server.tools or []:
+            tool_name = str(discovered.get("name", ""))
+            if mcp_function_name(server, tool_name) != name:
+                continue
+            if not mcp_tool_allowed(task, mcp_tool_access_mode(server, discovered)):
+                raise ValueError("The current task stage or permission does not allow this MCP tool.")
+            try:
+                return asyncio.run(mcp_call_tool_async(server, tool_name, arguments, {
+                    "LOCAL_AGENT_WORKSPACE": task.worktree_path or "",
+                }))
+            except (OSError, asyncio.TimeoutError, ValueError) as error:
+                raise ValueError(f"MCP Server {server.name} 调用失败：{error}") from error
+    raise ValueError(f"Unsupported tool: {name}")
+
+
+def tool_activity_detail(db: Session, task: Task, function_name: str) -> str:
+    for server in enabled_mcp_servers(db):
+        for tool in server.tools or []:
+            if mcp_function_name(server, str(tool.get("name", ""))) == function_name:
+                return f"正在调用 MCP Server {server.name} 的 {tool.get('name')}"
+    return f"正在执行 {function_name}"
 
 
 class TaskInput(BaseModel):
@@ -435,9 +696,21 @@ class PermissionInput(BaseModel):
     permission_mode: str = Field(pattern="^(read-only|workspace-write|full-access)$")
 
 
+class ExecutionModeInput(BaseModel):
+    execution_mode: Literal["confirm_before_coding", "automatic"]
+
+
+class TaskMcpToolInput(BaseModel):
+    server_id: str = Field(min_length=1, max_length=80)
+    tool_name: str = Field(min_length=1, max_length=160)
+    access_mode: Literal["read-only", "workspace-write", "full-access"]
+
+
 class TaskUpdateInput(BaseModel):
     title: str = Field(min_length=1, max_length=120)
     permission_mode: str = Field(pattern="^(read-only|workspace-write|full-access)$")
+    execution_mode: Literal["confirm_before_coding", "automatic"] | None = None
+    mcp_tools: list[TaskMcpToolInput] | None = Field(default=None, max_length=100)
 
 
 class MessageInput(BaseModel):
@@ -499,6 +772,13 @@ class ProviderInput(BaseModel):
         parsed = urlparse(self.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise HTTPException(422, "模型地址必须是 http 或 https URL")
+
+
+class McpServerInput(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    command: str = Field(min_length=1, max_length=500)
+    arguments: list[str] = Field(default_factory=list, max_length=40)
+    enabled: bool = True
 
 
 app = FastAPI(title="Local Agent Workbench", version="0.1.0")
@@ -564,6 +844,119 @@ def diagnose_model_provider(provider_id: str) -> dict[str, Any]:
         return {"ok": False, "status_code": None, "message": str(error)}
 
 
+@app.get("/api/mcp-servers")
+def list_mcp_servers() -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        return [dump_mcp_server(server) for server in db.scalars(select(McpServer).order_by(McpServer.created_at.desc()))]
+
+
+@app.post("/api/mcp-servers", status_code=201)
+def create_mcp_server(payload: McpServerInput) -> dict[str, Any]:
+    with SessionLocal() as db:
+        if db.scalar(select(McpServer).where(McpServer.name == payload.name.strip())):
+            raise HTTPException(409, "MCP Server 名称已存在")
+        server = McpServer(id=str(uuid.uuid4()), name=payload.name.strip(), command=payload.command.strip(),
+                           arguments=payload.arguments, enabled=payload.enabled, tools=[], created_at=now(), updated_at=now())
+        db.add(server)
+        try:
+            server.tools = classify_mcp_tools(server, discover_mcp_tools(server))
+        except ValueError as error:
+            db.rollback()
+            raise HTTPException(422, str(error)) from error
+        db.commit()
+        return dump_mcp_server(server)
+
+
+@app.post("/api/mcp-servers/presets/coding", status_code=201)
+def create_builtin_coding_mcp_server() -> dict[str, Any]:
+    """Register the bundled workspace MCP Server once for all tasks."""
+    with SessionLocal() as db:
+        existing = db.scalar(select(McpServer).where(McpServer.name == BUILTIN_CODING_MCP_NAME))
+        if existing:
+            return {"created": False, "server": dump_mcp_server(existing)}
+        server = McpServer(
+            id=str(uuid.uuid4()), name=BUILTIN_CODING_MCP_NAME, command=sys.executable,
+            arguments=[str(BUILTIN_CODING_MCP_SCRIPT)], enabled=True, tools=[], created_at=now(), updated_at=now(),
+        )
+        db.add(server)
+        try:
+            discovered = discover_mcp_tools(server)
+        except ValueError as error:
+            db.rollback()
+            raise HTTPException(422, str(error)) from error
+        server.tools = classify_mcp_tools(server, discovered)
+        db.commit()
+        return {"created": True, "server": dump_mcp_server(server)}
+
+
+@app.put("/api/mcp-servers/{server_id}")
+def update_mcp_server(server_id: str, payload: McpServerInput) -> dict[str, Any]:
+    with SessionLocal() as db:
+        server = db.get(McpServer, server_id)
+        if not server:
+            raise HTTPException(404, "MCP Server 不存在")
+        duplicate = db.scalar(select(McpServer).where(McpServer.name == payload.name.strip(), McpServer.id != server_id))
+        if duplicate:
+            raise HTTPException(409, "MCP Server 名称已存在")
+        server.name, server.command, server.arguments, server.enabled = payload.name.strip(), payload.command.strip(), payload.arguments, payload.enabled
+        try:
+            server.tools = classify_mcp_tools(server, discover_mcp_tools(server))
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        server.updated_at = now(); db.commit()
+        return dump_mcp_server(server)
+
+
+@app.post("/api/mcp-servers/{server_id}/diagnose")
+def diagnose_mcp_server(server_id: str) -> dict[str, Any]:
+    with SessionLocal() as db:
+        server = db.get(McpServer, server_id)
+        if not server:
+            raise HTTPException(404, "MCP Server 不存在")
+        try:
+            server.tools = classify_mcp_tools(server, discover_mcp_tools(server))
+            server.updated_at = now(); db.commit()
+            return {"ok": True, "message": "连接正常", "tools": server.tools}
+        except ValueError as error:
+            return {"ok": False, "message": str(error), "tools": []}
+
+
+@app.delete("/api/mcp-servers/{server_id}", status_code=204)
+def delete_mcp_server(server_id: str) -> None:
+    with SessionLocal() as db:
+        server = db.get(McpServer, server_id)
+        if not server:
+            raise HTTPException(404, "MCP Server 不存在")
+        for authorization in db.scalars(select(TaskMcpTool).where(TaskMcpTool.server_id == server_id)):
+            db.delete(authorization)
+        db.delete(server); db.commit()
+
+
+def replace_task_mcp_tools(db: Session, task: Task, tools: list[TaskMcpToolInput]) -> None:
+    unique = {(item.server_id, item.tool_name) for item in tools}
+    if len(unique) != len(tools):
+        raise HTTPException(422, "同一 MCP 工具只能授权一次")
+    for item in tools:
+        server = db.get(McpServer, item.server_id)
+        if not server or not server.enabled:
+            raise HTTPException(422, "MCP Server 不存在或未启用")
+        if not any(tool.get("name") == item.tool_name for tool in (server.tools or [])):
+            raise HTTPException(422, "MCP 工具不在已发现的工具清单中")
+    for authorization in db.scalars(select(TaskMcpTool).where(TaskMcpTool.task_id == task.id)):
+        db.delete(authorization)
+    db.add_all([TaskMcpTool(id=str(uuid.uuid4()), task_id=task.id, server_id=item.server_id,
+                            tool_name=item.tool_name, access_mode=item.access_mode) for item in tools])
+
+
+@app.get("/api/tasks/{task_id}/mcp-tools")
+def list_task_mcp_tools(task_id: str) -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        if not task:
+            raise HTTPException(404, "任务不存在")
+        return [dump_task_mcp_tool(authorization, server) for authorization, server in task_mcp_tools(db, task)]
+
+
 @app.get("/api/tasks")
 def list_tasks() -> list[dict[str, Any]]:
     with SessionLocal() as db:
@@ -585,7 +978,7 @@ def create_task(payload: TaskInput) -> dict[str, Any]:
         workspace = register_workspace(db, source_root, source_branch, payload.title, payload.test_command)
         record = Task(id=str(uuid.uuid4()), workspace_id=workspace.id, title=payload.title, requirement=payload.requirement,
                       status="awaiting_model", current_stage="需求分析", worktree_path=str(source_root), branch=source_branch,
-                      permission_mode="read-only", artifacts={}, created_at=now(), updated_at=now())
+                      permission_mode="read-only", execution_mode="confirm_before_coding", artifacts={}, created_at=now(), updated_at=now())
         db.add(record); db.commit()
         task = dump_task(record)
     return task
@@ -630,6 +1023,20 @@ def update_task_permission(task_id: str, payload: PermissionInput) -> dict[str, 
         return dump_task(task)
 
 
+@app.patch("/api/tasks/{task_id}/execution-mode")
+def update_task_execution_mode(task_id: str, payload: ExecutionModeInput) -> dict[str, Any]:
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+        if execution_mode_locked(task):
+            raise HTTPException(409, "Execution mode is locked after coding has started")
+        task.execution_mode = payload.execution_mode
+        task.updated_at = now()
+        db.commit()
+        return dump_task(task)
+
+
 @app.patch("/api/tasks/{task_id}")
 def update_task(task_id: str, payload: TaskUpdateInput) -> dict[str, Any]:
     with SessionLocal() as db:
@@ -638,6 +1045,12 @@ def update_task(task_id: str, payload: TaskUpdateInput) -> dict[str, Any]:
             raise HTTPException(404, "Task not found")
         task.title = payload.title.strip()
         task.permission_mode = payload.permission_mode
+        if payload.execution_mode is not None and payload.execution_mode != task.execution_mode and execution_mode_locked(task):
+            raise HTTPException(409, "Execution mode is locked after coding has started")
+        if payload.execution_mode is not None:
+            task.execution_mode = payload.execution_mode
+        if payload.mcp_tools is not None:
+            replace_task_mcp_tools(db, task, payload.mcp_tools)
         task.updated_at = now()
         db.commit()
         return dump_task(task)
@@ -649,6 +1062,8 @@ def delete_task(task_id: str) -> None:
         task = db.get(Task, task_id)
         if not task:
             raise HTTPException(404, "Task not found")
+        for authorization in db.scalars(select(TaskMcpTool).where(TaskMcpTool.task_id == task_id)):
+            db.delete(authorization)
         db.delete(task)
         db.commit()
 
@@ -744,7 +1159,7 @@ def sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def conversation_request(task: Task, provider: ModelProvider, history: list[dict[str, str]]) -> tuple[dict[str, Any], dict[str, str]]:
+def conversation_request(db: Session, task: Task, provider: ModelProvider, history: list[dict[str, str]]) -> tuple[dict[str, Any], dict[str, str]]:
     permission_descriptions = {
         "read-only": "Read-only: inspect files only inside the task code directory; never modify files or run commands.",
         "workspace-write": "Workspace write: read and modify files only inside the task code directory; do not run commands.",
@@ -769,7 +1184,7 @@ def conversation_request(task: Task, provider: ModelProvider, history: list[dict
             *([{"role": "system", "content": f"Compressed earlier conversation:\n{task.context_summary}"}] if task.context_summary else []),
             *history,
         ],
-        "tools": tools_for_task(task), "tool_choice": "auto", "stream": True,
+        "tools": tools_for_task(task, db), "tool_choice": "auto", "stream": True,
     }, {"Authorization": f"Bearer {read_secrets().get(snapshot['id'], '')}"}
 
 
@@ -797,8 +1212,15 @@ def stream_task_message(task_id: str, payload: MessageInput) -> StreamingRespons
             raise HTTPException(404, "Task not found")
         if not provider:
             raise HTTPException(409, "Configure and activate a model profile first")
+        try:
+            decision = master_agent_route(provider, task, content) if task.workflow_type == "unclassified" else None
+        except RoutingError as error:
+            message = str(error)
+            def routing_error_stream():
+                yield sse("error", {"message": message, "retryable": True})
+            return StreamingResponse(routing_error_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
         db.add(TaskMessage(id=str(uuid.uuid4()), task_id=task_id, role="user", content=content, created_at=now()))
-        stage_run = route_message(db, task, content)
+        stage_run = route_message(db, task, content, decision)
         stage_run_id = stage_run.id if stage_run else None
         task.updated_at = now()
         db.commit()
@@ -808,7 +1230,7 @@ def stream_task_message(task_id: str, payload: MessageInput) -> StreamingRespons
                 TaskMessage.context_compacted.is_(False),
             ).order_by(TaskMessage.created_at, TaskMessage.id)
         )]
-        request_body, headers = conversation_request(task, provider, history)
+        request_body, headers = conversation_request(db, task, provider, history)
         provider_url = api_root(provider.base_url)
 
     def event_stream():
@@ -866,8 +1288,10 @@ def stream_task_message(task_id: str, payload: MessageInput) -> StreamingRespons
                     name = function["name"]
                     try:
                         arguments = json.loads(function["arguments"] or "{}")
-                        yield sse("activity", {"kind": "tool", "title": "工作阶段", "detail": f"正在执行 {name}"})
-                        result = execute_tool(task, name, arguments)
+                        with SessionLocal() as tool_db:
+                            current_task = tool_db.get(Task, task_id)
+                            yield sse("activity", {"kind": "tool", "title": "工作阶段", "detail": tool_activity_detail(tool_db, current_task, name)})
+                            result = execute_tool(current_task, name, arguments, tool_db)
                         if name == "write_file":
                             yield sse("file", {"path": json.loads(result)["path"], "action": "已更改"})
                     except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, subprocess.SubprocessError) as error:
@@ -902,9 +1326,13 @@ def send_task_message(task_id: str, payload: MessageInput) -> dict[str, Any]:
             raise HTTPException(404, "任务不存在")
         if not provider:
             raise HTTPException(409, "请先配置并激活模型档案")
+        try:
+            decision = master_agent_route(provider, task, content) if task.workflow_type == "unclassified" else None
+        except RoutingError as error:
+            raise HTTPException(502, str(error)) from error
         user_message = TaskMessage(id=str(uuid.uuid4()), task_id=task_id, role="user", content=content, created_at=now())
         db.add(user_message)
-        stage_run = route_message(db, task, content)
+        stage_run = route_message(db, task, content, decision)
         stage_run_id = stage_run.id if stage_run else None
         task.updated_at = now()
         db.commit()
@@ -939,7 +1367,9 @@ def send_task_message(task_id: str, payload: MessageInput) -> dict[str, Any]:
         f"\nPermission: {permission_descriptions[task_snapshot['permission_mode']]} "
         "Use the provided local tools to inspect files before making claims about repository contents."
     )
-    request_body["tools"] = tools_for_task(task)
+    with SessionLocal() as db:
+        current_task = db.get(Task, task_id)
+        request_body["tools"] = tools_for_task(current_task, db)
     request_body["tool_choice"] = "auto"
     headers = {"Authorization": f"Bearer {read_secrets().get(provider_snapshot['id'], '')}"}
     try:
@@ -958,7 +1388,9 @@ def send_task_message(task_id: str, payload: MessageInput) -> dict[str, Any]:
                 function = call.get("function", {})
                 try:
                     arguments = json.loads(function.get("arguments", "{}"))
-                    result = execute_tool(task, function["name"], arguments)
+                    with SessionLocal() as db:
+                        current_task = db.get(Task, task_id)
+                        result = execute_tool(current_task, function["name"], arguments, db)
                 except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, subprocess.SubprocessError) as error:
                     result = json.dumps({"error": str(error)})
                 request_body["messages"].append({"role": "tool", "tool_call_id": call["id"], "content": result})

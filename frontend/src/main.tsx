@@ -15,8 +15,10 @@ import {
   Send,
   Settings2,
   Shield,
+  Workflow,
   TerminalSquare,
   Trash2,
+  RotateCcw,
   X,
 } from "lucide-react";
 import { createRoot } from "react-dom/client";
@@ -25,6 +27,10 @@ import remarkGfm from "remark-gfm";
 import "./styles.css";
 
 type PermissionMode = "read-only" | "workspace-write" | "full-access";
+type ExecutionMode = "confirm_before_coding" | "automatic";
+type McpAccessMode = "read-only" | "workspace-write" | "full-access";
+type McpTool = { name: string; description: string; input_schema: Record<string, unknown>; access_mode?: McpAccessMode };
+type McpServer = { id: string; name: string; command: string; arguments: string[]; enabled: boolean; tools: McpTool[] };
 type TaskMessage = {
   id: string;
   role: "user" | "assistant";
@@ -36,6 +42,9 @@ type Task = {
   title: string;
   requirement: string;
   permission_mode: PermissionMode;
+  write_enabled: boolean;
+  execution_mode: ExecutionMode;
+  execution_mode_locked: boolean;
   status: string;
   current_stage: string;
   workflow_type: string;
@@ -60,6 +69,7 @@ type Run = {
   files: ChangedFile[];
   complete: boolean;
   error?: string;
+  retryContent?: string;
 };
 type StageRun = {
   id: string;
@@ -88,11 +98,21 @@ const permissionLabels: Record<PermissionMode, string> = {
   "workspace-write": "工作区读写",
   "full-access": "完全访问",
 };
+const executionModeLabels: Record<ExecutionMode, string> = {
+  confirm_before_coding: "计划模式",
+  automatic: "自动编码",
+};
+const mcpAccessLabels: Record<McpAccessMode, string> = {
+  "read-only": "只读",
+  "workspace-write": "工作区写入",
+  "full-access": "完全访问",
+};
 
 function App() {
   const [tasks, setTasks] = useState<Task[]>([]),
     [selected, setSelected] = useState<Task | null>(null),
     [providers, setProviders] = useState<Provider[]>([]),
+    [mcpServers, setMcpServers] = useState<McpServer[]>([]),
     [messages, setMessages] = useState<TaskMessage[]>([]),
     [stageRuns, setStageRuns] = useState<StageRun[]>([]),
     [contextUsage, setContextUsage] = useState<ContextUsage | null>(null),
@@ -105,19 +125,23 @@ function App() {
     [taskConfig, setTaskConfig] = useState<Task | null>(null),
     [taskMenu, setTaskMenu] = useState<string | null>(null),
     [showProviders, setShowProviders] = useState(false),
+    [showMcpServers, setShowMcpServers] = useState(false),
     [showModels, setShowModels] = useState(false),
-    [showPermissions, setShowPermissions] = useState(false);
+    [showPermissions, setShowPermissions] = useState(false),
+    [showExecutionModes, setShowExecutionModes] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const activeProvider =
     providers.find((provider) => provider.is_active) ?? null;
   const load = async () => {
     try {
-      const [taskList, providerList] = await Promise.all([
+      const [taskList, providerList, serverList] = await Promise.all([
         api<Task[]>("/api/tasks"),
         api<Provider[]>("/api/model-providers"),
+        api<McpServer[]>("/api/mcp-servers"),
       ]);
       setTasks(taskList);
       setProviders(providerList);
+      setMcpServers(serverList);
     } catch (error) {
       setNotice(String(error).replace(/^Error: /, ""));
     }
@@ -185,6 +209,21 @@ function App() {
         items.map((item) => (item.id === task.id ? task : item)),
       );
       setShowPermissions(false);
+      composerRef.current?.focus();
+    } catch (error) {
+      setNotice(String(error).replace(/^Error: /, ""));
+    }
+  };
+  const selectExecutionMode = async (execution_mode: ExecutionMode) => {
+    if (!selected || selected.execution_mode_locked) return;
+    try {
+      const task = await api<Task>(`/api/tasks/${selected.id}/execution-mode`, {
+        method: "PATCH",
+        body: JSON.stringify({ execution_mode }),
+      });
+      setSelected(task);
+      setTasks((items) => items.map((item) => (item.id === task.id ? task : item)));
+      setShowExecutionModes(false);
       composerRef.current?.focus();
     } catch (error) {
       setNotice(String(error).replace(/^Error: /, ""));
@@ -288,9 +327,9 @@ function App() {
       setCompressing(false);
     }
   };
-  const sendMessage = async (event?: FormEvent) => {
+  const sendMessage = async (event?: FormEvent, retryContent?: string) => {
     event?.preventDefault();
-    const content = draft.trim();
+    const content = retryContent ?? draft.trim();
     if (!selected || !content || sending || compressing) return;
     if (!activeProvider) {
       setNotice("请先选择模型档案。");
@@ -310,7 +349,13 @@ function App() {
     ]);
     setRuns((items) => [
       ...items,
-      { id: runId, content: "", activities: [], files: [], complete: false },
+      {
+        id: runId,
+        content: "",
+        activities: [{ kind: "agent", title: "主 Agent 路由", detail: "正在判定任务复杂度和协作流程" }],
+        files: [],
+        complete: false,
+      },
     ]);
     setDraft("");
     setSending(true);
@@ -360,17 +405,22 @@ function App() {
           if (eventName === "error")
             updateRun(runId, (run) => ({
               ...run,
+              title: payload.retryable ? "主 Agent 路由失败" : run.title,
               complete: true,
               error: payload.message,
+              retryContent: payload.retryable ? content : undefined,
             }));
         }
       }
       await refreshTaskWorkflow(taskId);
+      // The persisted assistant reply now represents this run in chronological history.
+      setRuns((items) => items.filter((run) => run.id !== runId));
     } catch (error) {
       updateRun(runId, (run) => ({
         ...run,
         complete: true,
         error: String(error).replace(/^Error: /, ""),
+        retryContent: content,
       }));
     } finally {
       setSending(false);
@@ -399,6 +449,13 @@ function App() {
           onClick={() => setShowProviders(true)}
         >
           <Settings2 size={16} /> 配置模型接口
+        </button>
+        <button
+          className="settings-button"
+          title="配置本地 MCP Server"
+          onClick={() => setShowMcpServers(true)}
+        >
+          <TerminalSquare size={16} /> MCP Server
         </button>
       </header>
       {notice && (
@@ -453,6 +510,12 @@ function App() {
             <div className="chat-shell">
               <div className="chat-title">
                 <h1>{selected.title}</h1>
+                <span
+                  className={`write-status ${selected.write_enabled ? "enabled" : "disabled"}`}
+                  title={selected.write_enabled ? "当前阶段允许修改任务工作区文件" : "文件写入会在编码实现或修复阶段启用；请先选择工作区读写权限并完成编码确认"}
+                >
+                  {selected.write_enabled ? "可修改文件" : "只读（待编码确认）"}
+                </span>
               </div>
               <div className="message-list">
                 {messages.length === 0 && (
@@ -467,9 +530,9 @@ function App() {
                     className={`message ${message.role}`}
                     key={message.id}
                   >
-                    {message.role === "assistant" && (
-                      <div className="message-role">Agent</div>
-                    )}
+                    <div className="message-role">
+                      {message.role === "user" ? "你" : "Agent"}
+                    </div>
                     {message.role === "assistant" ? (
                       <MarkdownContent content={message.content} taskId={selected.id} />
                     ) : (
@@ -478,7 +541,12 @@ function App() {
                   </article>
                 ))}
                 {runs.map((run) => (
-                  <RunOutput key={run.id} run={run} taskId={selected.id} />
+                  <RunOutput
+                    key={run.id}
+                    run={run}
+                    taskId={selected.id}
+                    onRetry={(content) => void sendMessage(undefined, content)}
+                  />
                 ))}
               </div>
               <form className="message-composer" onSubmit={sendMessage}>
@@ -530,6 +598,32 @@ function App() {
                             {selected.permission_mode === mode && (
                               <Check size={15} />
                             )}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="execution-mode-picker">
+                    <button
+                      type="button"
+                      className="execution-mode-button"
+                      disabled={selected.execution_mode_locked}
+                      onClick={() => setShowExecutionModes((open) => !open)}
+                      title={selected.execution_mode_locked ? "编码已开始，执行模式已锁定" : "选择当前任务的执行模式"}
+                    >
+                      <Workflow size={15} />
+                      <span>{executionModeLabels[selected.execution_mode]}</span>
+                      <ChevronDown size={14} />
+                    </button>
+                    {showExecutionModes && !selected.execution_mode_locked && (
+                      <div className="execution-mode-menu">
+                        {(Object.keys(executionModeLabels) as ExecutionMode[]).map((mode) => (
+                          <button type="button" key={mode} className={selected.execution_mode === mode ? "selected" : ""} onClick={() => void selectExecutionMode(mode)}>
+                            <span>
+                              <strong>{executionModeLabels[mode]}</strong>
+                              <small>{mode === "confirm_before_coding" ? "完成分析与设计后，编码前等待确认" : "完成设计后连续进入编码、审核和测试"}</small>
+                            </span>
+                            {selected.execution_mode === mode && <Check size={15} />}
                           </button>
                         ))}
                       </div>
@@ -660,6 +754,13 @@ function App() {
           onChanged={load}
         />
       )}
+      {showMcpServers && (
+        <McpServerModal
+          servers={mcpServers}
+          onClose={() => setShowMcpServers(false)}
+          onChanged={load}
+        />
+      )}
     </main>
   );
 }
@@ -696,7 +797,7 @@ function MarkdownContent({
   );
 }
 
-function RunOutput({ run, taskId }: { run: Run; taskId: string }) {
+function RunOutput({ run, taskId, onRetry }: { run: Run; taskId: string; onRetry: (content: string) => void }) {
   const icon = (kind: string) =>
     kind === "network" ? (
       <Globe2 size={14} />
@@ -727,7 +828,14 @@ function RunOutput({ run, taskId }: { run: Run; taskId: string }) {
         </div>
       </details>
       {run.error ? (
-        <p className="stream-error">{run.error}</p>
+        <>
+          <p className="stream-error">{run.error}</p>
+          {run.retryContent && (
+            <button className="retry-button" type="button" onClick={() => onRetry(run.retryContent!)}>
+              <RotateCcw size={15} /> 重试主 Agent 判定
+            </button>
+          )}
+        </>
       ) : (
         run.content && <MarkdownContent content={run.content} taskId={taskId} />
       )}
@@ -974,6 +1082,92 @@ function TaskModal({
   );
 }
 
+function McpServerModal({
+  servers,
+  onClose,
+  onChanged,
+}: {
+  servers: McpServer[];
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [editing, setEditing] = useState<McpServer | null>(null);
+  const [name, setName] = useState("");
+  const [command, setCommand] = useState("");
+  const [argumentsText, setArgumentsText] = useState("[]");
+  const [enabled, setEnabled] = useState(true);
+  const [message, setMessage] = useState("");
+  const reset = () => {
+    setEditing(null); setName(""); setCommand(""); setArgumentsText("[]"); setEnabled(true); setMessage("");
+  };
+  const edit = (server: McpServer) => {
+    setEditing(server); setName(server.name); setCommand(server.command);
+    setArgumentsText(JSON.stringify(server.arguments, null, 2)); setEnabled(server.enabled); setMessage("");
+  };
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    try {
+      const argumentsList: unknown = JSON.parse(argumentsText);
+      if (!Array.isArray(argumentsList) || !argumentsList.every((item) => typeof item === "string"))
+        throw new Error("启动参数必须是字符串 JSON 数组。");
+      const payload = { name, command, arguments: argumentsList, enabled };
+      const server = await api<McpServer>(editing ? `/api/mcp-servers/${editing.id}` : "/api/mcp-servers", {
+        method: editing ? "PUT" : "POST", body: JSON.stringify(payload),
+      });
+      setMessage(`已发现 ${server.tools.length} 个工具。`);
+      onChanged();
+      if (!editing) reset();
+    } catch (error) {
+      setMessage(String(error).replace(/^Error: /, ""));
+    }
+  };
+  const diagnose = async (server: McpServer) => {
+    try {
+      const result = await api<{ ok: boolean; message: string; tools: McpTool[] }>(`/api/mcp-servers/${server.id}/diagnose`, { method: "POST" });
+      setMessage(result.ok ? `${server.name}：${result.message}，发现 ${result.tools.length} 个工具。` : `${server.name}：${result.message}`);
+      onChanged();
+    } catch (error) { setMessage(String(error).replace(/^Error: /, "")); }
+  };
+  const addCodingPreset = async () => {
+    try {
+      const result = await api<{ created: boolean; server: McpServer }>("/api/mcp-servers/presets/coding", { method: "POST" });
+      setMessage(result.created ? `已添加 ${result.server.name}，所有任务现在都可自动使用其工具。` : `${result.server.name} 已存在，所有任务均可使用。`);
+      onChanged();
+    } catch (error) { setMessage(String(error).replace(/^Error: /, "")); }
+  };
+  const remove = async (server: McpServer) => {
+    if (!window.confirm(`删除 MCP Server“${server.name}”？所有任务将不再使用它。`)) return;
+    try { await api<void>(`/api/mcp-servers/${server.id}`, { method: "DELETE" }); onChanged(); if (editing?.id === server.id) reset(); }
+    catch (error) { setMessage(String(error).replace(/^Error: /, "")); }
+  };
+  return (
+    <div className="modal-back">
+      <section className="modal mcp-modal">
+        <div className="modal-heading"><h2>本地 MCP Server</h2><button title="关闭" onClick={onClose}><X size={17} /></button></div>
+        <p className="modal-intro">已启用 Server 的工具会提供给所有任务；调用仍受每个任务的阶段和 Agent 权限限制。命令和参数不会经由 shell 解析。</p>
+        <div className="modal-actions"><button type="button" className="primary" onClick={() => void addCodingPreset()}>添加预制编码 MCP Server</button></div>
+        <div className="provider-list">
+          {servers.length ? servers.map((server) => (
+            <div className="provider-row mcp-server-row" key={server.id}>
+              <div><strong>{server.name}</strong><small>{server.command} · {server.tools.length} 个工具 · {server.enabled ? "已启用" : "已禁用"}</small><small>{server.tools.map((tool) => `${tool.name}（${mcpAccessLabels[tool.access_mode ?? "read-only"]}）`).join("、")}</small></div>
+              <div className="mcp-row-actions"><button type="button" onClick={() => void diagnose(server)}>诊断</button><button type="button" onClick={() => edit(server)}>编辑</button><button type="button" className="danger" onClick={() => void remove(server)}>删除</button></div>
+            </div>
+          )) : <p>尚未配置 MCP Server。</p>}
+        </div>
+        <form onSubmit={submit} className="provider-form">
+          <h3>{editing ? `编辑 ${editing.name}` : "添加本地 stdio Server"}</h3>
+          <label>名称<input required value={name} onChange={(event) => setName(event.target.value)} /></label>
+          <label>启动命令<input required placeholder="npx 或 python" value={command} onChange={(event) => setCommand(event.target.value)} /></label>
+          <label>启动参数（JSON 字符串数组）<textarea required value={argumentsText} onChange={(event) => setArgumentsText(event.target.value)} /></label>
+          <label className="checkbox-label"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />启用此 Server</label>
+          {message && <p className={message.includes("失败") || message.includes("Error") ? "error" : "form-message"}>{message}</p>}
+          <div className="modal-actions">{editing && <button type="button" onClick={reset}>新增 Server</button>}<button className="primary">保存并发现工具</button></div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 function TaskConfigModal({
   task,
   onClose,
@@ -985,13 +1179,14 @@ function TaskConfigModal({
 }) {
   const [title, setTitle] = useState(task.title);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(task.permission_mode);
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>(task.execution_mode);
   const [error, setError] = useState("");
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     try {
       onUpdated(await api<Task>(`/api/tasks/${task.id}`, {
         method: "PATCH",
-        body: JSON.stringify({ title, permission_mode: permissionMode }),
+        body: JSON.stringify({ title, permission_mode: permissionMode, execution_mode: executionMode }),
       }));
     } catch (reason) {
       setError(String(reason).replace(/^Error: /, ""));
@@ -1016,6 +1211,15 @@ function TaskConfigModal({
             ))}
           </select>
         </label>
+        <label>
+          默认执行模式
+          <select disabled={task.execution_mode_locked} value={executionMode} onChange={(event) => setExecutionMode(event.target.value as ExecutionMode)}>
+            {(Object.keys(executionModeLabels) as ExecutionMode[]).map((mode) => (
+              <option key={mode} value={mode}>{executionModeLabels[mode]}</option>
+            ))}
+          </select>
+        </label>
+        {task.execution_mode_locked && <p className="form-message">编码已开始，执行模式已锁定。</p>}
         {error && <p className="error">{error}</p>}
         <div className="modal-actions">
           <button type="button" onClick={onClose}>取消</button>
