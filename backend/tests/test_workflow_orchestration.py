@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 
@@ -7,7 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from backend.app import main
-from backend.app.main import ModelProvider, SessionLocal, app, read_secrets, write_secrets
+from backend.app.main import ModelProvider, SessionLocal, TaskMessage, app, read_secrets, write_secrets
 from backend.tests.test_task_sources import init_clean_repo, remove_workspace_by_path
 
 
@@ -176,6 +177,83 @@ def test_master_agent_json_route_controls_workflow_and_persists_contract(monkeyp
         remove_workspace_by_path(repo)
 
 
+def test_master_agent_can_plan_only_remaining_stages_from_persisted_context(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "context-aware-route"
+    init_clean_repo(repo)
+    provider = ModelProvider(id=str(uuid.uuid4()), name="context-router", kind="external", base_url="https://example.test/v1",
+                             model_name="test-model", is_active=True, created_at=main.now())
+    captured: dict = {}
+
+    class Response:
+        def raise_for_status(self) -> None: pass
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": json.dumps({
+                "task_type": "development", "complexity_reason": "已有设计产物，只需实施、审查和测试。", "workflow": "simple",
+                "required_stages": [main.IMPLEMENTATION_STAGE, main.CODE_REVIEW_STAGE, main.UNIT_TESTING_STAGE],
+            }, ensure_ascii=False)}}]}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return Response()
+
+    monkeypatch.setattr(main.httpx, "post", fake_post)
+    try:
+        with SessionLocal() as db:
+            workspace = main.register_workspace(db, repo, "main", "context-router", ["python", "-m", "pytest"])
+            task = main.Task(id=str(uuid.uuid4()), workspace_id=workspace.id, title="已有方案的改动", requirement="", status="created",
+                             current_stage="", worktree_path=str(repo), context_summary="概要和详细设计已经确认。",
+                             artifacts={"design": {"stage": main.DETAILED_DESIGN_STAGE, "content": "已确认接口和数据结构。"}},
+                             execution_mode="automatic", created_at=main.now(), updated_at=main.now())
+            db.add(task)
+            db.add(TaskMessage(id=str(uuid.uuid4()), task_id=task.id, role="user", content="设计已完成，开始实现。", created_at=main.now()))
+            db.flush()
+            decision = main.master_agent_route(provider, task, "请按既有方案实现", main.routing_context(db, task))
+            run = main.route_message(db, task, "请按既有方案实现", decision)
+            assert run is not None
+            assert run.stage == main.IMPLEMENTATION_STAGE
+            assert decision.required_stages == [main.IMPLEMENTATION_STAGE, main.CODE_REVIEW_STAGE, main.UNIT_TESTING_STAGE]
+            prompt = captured["messages"][1]["content"]
+            assert "概要和详细设计已经确认" in prompt
+            assert main.DETAILED_DESIGN_STAGE in prompt
+    finally:
+        remove_workspace_by_path(repo)
+
+
+def test_new_instruction_replans_an_existing_task_instead_of_reusing_test_stage(tmp_path: Path) -> None:
+    repo = tmp_path / "replan-existing-task"
+    init_clean_repo(repo)
+    try:
+        task = client.post("/api/tasks", json={"source_type": "local", "local_path": str(repo), "title": "已有流程的任务"}).json()
+        with SessionLocal() as db:
+            record = db.get(main.Task, task["id"])
+            record.workflow_type = "full"
+            record.task_kind = "development"
+            record.execution_mode = "automatic"
+            record.current_stage = main.UNIT_TESTING_STAGE
+            record.status = "awaiting_input"
+            record.assigned_agent = "测试 Agent"
+            record.routing_decision = {
+                "task_type": "development", "complexity_reason": "旧计划", "workflow": "full",
+                "required_stages": main.WORKFLOW_STAGES["full"],
+            }
+            new_instruction = "解决 JWT 密钥可能不安全问题"
+            assert main.should_replan(record, new_instruction)
+            decision = main.RoutingDecision(
+                task_type="development", complexity_reason="需要直接修复 JWT 配置并验证。", workflow="simple",
+                required_stages=[main.IMPLEMENTATION_STAGE, main.CODE_REVIEW_STAGE, main.UNIT_TESTING_STAGE],
+            )
+            run = main.route_message(db, record, new_instruction, decision)
+            assert run is not None
+            assert run.stage == main.IMPLEMENTATION_STAGE
+            assert run.agent == "执行 Agent"
+            assert record.current_stage == main.IMPLEMENTATION_STAGE
+            assert record.routing_decision == decision.model_dump()
+            record.current_stage = main.AWAIT_CODING_APPROVAL_STAGE
+            assert not main.should_replan(record, "确认继续")
+    finally:
+        remove_workspace_by_path(repo)
+
+
 def test_master_agent_rejects_invalid_stage_contract_without_starting_task(monkeypatch, tmp_path: Path) -> None:
     repo = tmp_path / "invalid-master-route"
     init_clean_repo(repo)
@@ -185,7 +263,7 @@ def test_master_agent_rejects_invalid_stage_contract_without_starting_task(monke
     class Response:
         def raise_for_status(self) -> None: pass
         def json(self) -> dict:
-            return {"choices": [{"message": {"content": '{"task_type":"development","complexity_reason":"x","workflow":"simple","required_stages":["编码实现"]}'}}]}
+            return {"choices": [{"message": {"content": '{"task_type":"development","complexity_reason":"x","workflow":"simple","required_stages":["代码审核","编码实现"]}'}}]}
 
     monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: Response())
     try:

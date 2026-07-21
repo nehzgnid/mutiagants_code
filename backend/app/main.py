@@ -243,14 +243,24 @@ WORKFLOW_STAGES = {
     "simple": [REQUIREMENTS_STAGE, IMPLEMENTATION_STAGE, CODE_REVIEW_STAGE, UNIT_TESTING_STAGE],
     "full": [REQUIREMENTS_STAGE, HIGH_LEVEL_DESIGN_STAGE, DETAILED_DESIGN_STAGE, IMPLEMENTATION_STAGE, CODE_REVIEW_STAGE, UNIT_TESTING_STAGE],
 }
+DEVELOPMENT_STAGES = WORKFLOW_STAGES["full"]
 
 
 def validate_routing_decision(payload: Any) -> RoutingDecision:
     decision = RoutingDecision.model_validate(payload)
-    if decision.required_stages != WORKFLOW_STAGES[decision.workflow]:
-        raise ValueError("required_stages must match the approved sequence for the selected workflow.")
     if (decision.workflow == "read_only") != (decision.task_type == "read_only_analysis"):
         raise ValueError("task_type and workflow must describe the same task category.")
+    if decision.workflow == "read_only":
+        if decision.required_stages != [READ_ONLY_STAGE]:
+            raise ValueError("read_only tasks may contain only the read-only analysis stage.")
+        return decision
+    if not all(stage in DEVELOPMENT_STAGES for stage in decision.required_stages):
+        raise ValueError("development tasks may contain only approved development stages.")
+    if len(set(decision.required_stages)) != len(decision.required_stages):
+        raise ValueError("required_stages must not repeat a stage.")
+    ordered_positions = [DEVELOPMENT_STAGES.index(stage) for stage in decision.required_stages]
+    if ordered_positions != sorted(ordered_positions):
+        raise ValueError("required_stages must preserve the approved stage order.")
     return decision
 
 
@@ -258,21 +268,45 @@ class RoutingError(Exception):
     """The master agent did not produce a safe routing decision."""
 
 
-def master_agent_route(provider: ModelProvider, task: Task, content: str) -> RoutingDecision:
+def routing_context(db: Session, task: Task) -> str:
+    """Give the router enough persisted state to omit work already completed."""
+    recent_messages = list(db.scalars(
+        select(TaskMessage).where(TaskMessage.task_id == task.id).order_by(TaskMessage.created_at.desc(), TaskMessage.id.desc()).limit(8)
+    ))
+    recent_messages.reverse()
+    artifacts = list((task.artifacts or {}).values())[-6:]
+    artifact_summary = [
+        {"stage": artifact.get("stage"), "content": str(artifact.get("content", ""))[:500]}
+        for artifact in artifacts if isinstance(artifact, dict)
+    ]
+    return json.dumps({
+        "current_stage": task.current_stage,
+        "previous_workflow": task.workflow_type,
+        "previous_plan": task.routing_decision,
+        "compressed_context": task.context_summary,
+        "completed_artifacts": artifact_summary,
+        "recent_messages": [{"role": message.role, "content": message.content[:1_000]} for message in recent_messages],
+    }, ensure_ascii=False)
+
+
+def master_agent_route(provider: ModelProvider, task: Task, content: str, context: str = "") -> RoutingDecision:
     """Ask the master agent for a JSON-only routing decision, then enforce its contract locally."""
     contract = {
         "task_type": "read_only_analysis | development",
         "complexity_reason": "non-empty concise Chinese reason",
-        "workflow": "read_only | simple | full",
-        "required_stages": "exact approved stage sequence for workflow",
+        "workflow": "read_only | simple | full (a descriptive collaboration mode, not a fixed sequence)",
+        "required_stages": "the necessary non-repeating stages, selected independently in approved order",
     }
     prompt = (
         "You are the master agent that routes a local coding task. Return only one JSON object, with no Markdown. "
         f"Its exact keys and constraints are: {json.dumps(contract, ensure_ascii=False)}. "
-        f"Approved sequences: {json.dumps(WORKFLOW_STAGES, ensure_ascii=False)}. "
-        "Use read_only only for requests that do not ask for a change. Use full when cross-module, security, architecture, "
-        "data migration, or multi-file coordination needs explicit design stages; otherwise use simple. "
-        f"Task title: {task.title}\nTask requirement: {task.requirement}\nIncoming message: {content}"
+        f"Allowed read-only stages: {json.dumps([READ_ONLY_STAGE], ensure_ascii=False)}. "
+        f"Allowed development stages, in the only valid order: {json.dumps(DEVELOPMENT_STAGES, ensure_ascii=False)}. "
+        "Plan only the stages still needed for this request. Do not add requirements or design stages when the supplied context "
+        "already contains adequate completed planning; start at implementation, review, testing, or another necessary later stage. "
+        "You may choose any ordered subset of the development stages, including a planning-only sequence. The workflow label is "
+        "descriptive only: simple and full do not impose fixed stage lists. Use read_only only for requests that do not ask for a change. "
+        f"Task title: {task.title}\nTask requirement: {task.requirement}\nPersisted task context: {context or '(none)'}\nIncoming message: {content}"
     )
     try:
         response = httpx.post(
@@ -343,7 +377,24 @@ def start_stage(db: Session, task: Task, stage: str, content: str) -> StageRun:
     return run
 
 
+def should_replan(task: Task, content: str) -> bool:
+    """Every new instruction is master-routed; explicit approval keeps its guarded transition."""
+    return not (
+        task.current_stage in {AWAIT_CODING_APPROVAL_STAGE, AWAIT_ACCEPTANCE_STAGE}
+        and any(keyword in content.lower() for keyword in CONFIRMATION_KEYWORDS)
+    )
+
+
 def route_message(db: Session, task: Task, content: str, decision: RoutingDecision | None = None) -> StageRun | None:
+    if decision:
+        stage = apply_routing_decision(task, decision)
+        if stage == IMPLEMENTATION_STAGE and task.execution_mode != "automatic":
+            task.current_stage = AWAIT_CODING_APPROVAL_STAGE
+            task.assigned_agent = "主 Agent"
+            task.status = "awaiting_input"
+            task.updated_at = now()
+            return None
+        return start_stage(db, task, stage, content)
     if task.current_stage in {AWAIT_CODING_APPROVAL_STAGE, AWAIT_ACCEPTANCE_STAGE}:
         if not any(keyword in content.lower() for keyword in CONFIRMATION_KEYWORDS):
             return None
@@ -356,10 +407,7 @@ def route_message(db: Session, task: Task, content: str, decision: RoutingDecisi
     if task.workflow_type not in {None, "unclassified"} and task.current_stage != COMPLETED_STAGE:
         return start_stage(db, task, task.current_stage, content)
     if task.status != "in_progress" or task.current_stage == COMPLETED_STAGE:
-        if not decision:
-            raise RoutingError("主 Agent 路由失败：未提供可验证的路由决策。")
-        stage = apply_routing_decision(task, decision)
-        return start_stage(db, task, stage, content)
+        raise RoutingError("主 Agent 路由失败：未提供可验证的路由决策。")
     return start_stage(db, task, task.current_stage, content)
 
 
@@ -1213,7 +1261,7 @@ def stream_task_message(task_id: str, payload: MessageInput) -> StreamingRespons
         if not provider:
             raise HTTPException(409, "Configure and activate a model profile first")
         try:
-            decision = master_agent_route(provider, task, content) if task.workflow_type == "unclassified" else None
+            decision = master_agent_route(provider, task, content, routing_context(db, task)) if should_replan(task, content) else None
         except RoutingError as error:
             message = str(error)
             def routing_error_stream():
@@ -1327,7 +1375,7 @@ def send_task_message(task_id: str, payload: MessageInput) -> dict[str, Any]:
         if not provider:
             raise HTTPException(409, "请先配置并激活模型档案")
         try:
-            decision = master_agent_route(provider, task, content) if task.workflow_type == "unclassified" else None
+            decision = master_agent_route(provider, task, content, routing_context(db, task)) if should_replan(task, content) else None
         except RoutingError as error:
             raise HTTPException(502, str(error)) from error
         user_message = TaskMessage(id=str(uuid.uuid4()), task_id=task_id, role="user", content=content, created_at=now())

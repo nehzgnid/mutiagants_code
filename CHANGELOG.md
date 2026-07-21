@@ -974,6 +974,66 @@ Verification: static review of backend routing, UI configuration, and MCP-focuse
 
 Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 26 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
 
+
+
+## 2026-07-21
+
+### Plan
+
+- Requirements analysis: the master Agent was limited to three fixed stage sequences and routed only from the incoming message, so it could repeat planning already completed in the task context.
+- High-level design: retain the three workflow labels for task classification, but let the master Agent select the concrete remaining stages from the permitted ordered stage set.
+- Detailed design: supply the router with recent conversation, compressed context, prior plan, current stage, and completed artifact summaries; validate that selected stages are unique and ordered while preserving read-only, confirmation, and tool-permission gates.
+
+Verification: inspected routing validation, task state transitions, persisted artifacts, context compaction data, and tool access checks.
+
+### Code
+
+- Reworked master-Agent routing so `simple` and `full` are descriptive collaboration modes rather than fixed sequences. The Agent can now choose only the necessary ordered development stages, including starting directly at implementation, review, or testing when prior context already contains planning.
+- Added persisted-context assembly for both streaming and non-streaming routing requests, including recent messages, compressed context, previous plans, current state, and completed artifact summaries.
+
+Verification: `git diff --check` passed; static search confirmed the fixed-sequence validation and prompt wording were removed.
+
+### Code Review
+
+- Confirmed arbitrary stage names, duplicate stages, and out-of-order development plans are rejected; read-only requests remain restricted to analysis, and existing coding-confirmation and write-permission enforcement are unchanged.
+
+Verification: reviewed `backend/app/main.py` routing validation, prompt construction, state transitions, and tool availability checks.
+
+### Unit Testing
+
+- Added coverage proving that a task with persisted design context can select implementation, code review, and unit testing without repeating planning; updated invalid-route coverage to reject an out-of-order stage plan.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 30 tests and 1 existing Starlette deprecation warning.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: a new repair instruction submitted while a task was waiting at unit testing was treated as input to the Test Agent, so the task produced an audit response instead of replanning the repair.
+- High-level design: have the master Agent re-evaluate every new instruction against persisted task context; reserve only explicit coding and acceptance confirmations for their existing guarded transitions.
+- Detailed design: replace the stored plan with the validated new plan before selecting its first stage; retain the coding confirmation gate when a replanned workflow starts at implementation.
+
+Verification: traced the reported JWT task state, persisted stage records, and the message-routing path.
+
+### Code
+
+- Updated streaming and non-streaming message routes to invoke master-Agent planning for new instructions on existing tasks, preventing a stale review or test stage from owning unrelated work.
+- Added a guarded replan path that assigns the newly selected first stage and Agent while preserving approval-before-coding behavior.
+
+Verification: `git diff --check` passed.
+
+### Code Review
+
+- Confirmed explicit confirmation messages still advance the existing approval states without re-routing, while every other instruction replaces stale workflow plans through validated stage selection.
+
+Verification: reviewed `backend/app/main.py` state transitions and permission gates.
+
+### Unit Testing
+
+- Added coverage for a JWT repair request submitted during an existing unit-test stage; it is replanned to the Execution Agent instead of reusing the Test Agent.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 33 tests and 1 existing Starlette deprecation warning.
+
 ## 2026-07-21
 
 ### Plan
@@ -987,6 +1047,38 @@ Verification: traced the message-list rendering and confirmed that `messages` an
 ### Code
 
 - Removed completed streaming runs after their persisted history refresh, preventing duplicate, out-of-order Agent output in the conversation view.
+
+### Correction
+
+- Reload persisted task messages as part of that history refresh before removing the completed temporary run, so the submitted user message and final Agent reply remain visible without a browser reload.
+
+Verification: full backend suite passed with 31 tests and 1 existing Starlette deprecation warning; frontend production build and `git diff --check` passed.
+
+### Plan
+
+- Requirements analysis: restore the completed execution-process disclosure without reintroducing the prior out-of-order, duplicate run rendering.
+- High-level design: use persisted stage-run metadata for completed conversations and retain the existing temporary stream trace only while a response is running.
+- Detailed design: associate a completed stage run with its persisted assistant message by exact output content, then render a closed `details` disclosure containing its stage, Agent, status, and input summary.
+
+Verification: reviewed persisted `StageRun` fields and the conversation rendering lifecycle.
+
+### Code
+
+- Added a per-reply expandable `工作过程` panel backed by persisted stage-run data, including compact stage, Agent, status, and request-summary information.
+
+Verification: focused frontend rendering tests and production build passed.
+
+### Code Review
+
+- Confirmed completed traces are nested within their matching Agent reply and do not form a separate conversation group; unmatched or failed streaming runs retain their existing temporary handling.
+
+Verification: static review of stage-run matching and the stream completion path.
+
+### Unit Testing
+
+- Added a frontend contract requiring an expandable completed stage trace matched to the persisted Agent reply.
+
+Verification: full backend suite passed with 32 tests and 1 existing Starlette deprecation warning; frontend production build and `git diff --check` passed.
 
 Verification: reviewed the post-stream lifecycle in `frontend/src/main.tsx`.
 

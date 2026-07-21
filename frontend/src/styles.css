@@ -57,6 +57,19 @@ header { height: 54px; display: flex; align-items: center; justify-content: spac
 .activity.error svg { color: #b5352d; }
 .activity strong { display: block; color: #40505a; font-size: 12px; }
 .activity span { line-height: 1.45; }
+.completed-trace { margin-bottom: 12px; }
+.stage-run-input { margin: 7px 0 2px; color: #687780; font-size: 12px; line-height: 1.5; white-space: pre-wrap; }
+.workflow-plan { margin: 5px 0 10px; padding: 9px 10px; border: 1px solid #d7e3df; border-radius: 6px; background: #f7fbf9; }
+.workflow-plan-title { margin: 0; color: #1c6659; font-size: 12px; font-weight: 700; }
+.workflow-plan-reason { margin: 4px 0 7px; color: #687780; font-size: 12px; line-height: 1.45; }
+.workflow-stages { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.workflow-step { display: flex; align-items: flex-start; gap: 7px; color: #40505a; font-size: 12px; }
+.workflow-step svg { flex: 0 0 auto; margin-top: 2px; color: #438a79; }
+.workflow-step strong { display: block; font-size: 12px; }
+.workflow-step.pending { color: #8a979d; }
+.workflow-step.pending svg { color: #a9b4b8; }
+.workflow-step.current { color: #235d82; }
+.workflow-step.current svg { color: #317da8; }
 .stream-error { color: #b5352d; } .retry-button { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; margin-top: 4px; padding: 6px 10px; border-color: #c87532; color: #8b4d16; background: #fff8ef; }
 .context-monitor { position: relative; display: flex; align-items: center; }
 .context-ring { position: relative; width: 28px; height: 28px; min-height: 28px; padding: 0; border: 0; border-radius: 50%; }

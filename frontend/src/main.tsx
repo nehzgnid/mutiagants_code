@@ -49,6 +49,13 @@ type Task = {
   current_stage: string;
   workflow_type: string;
   assigned_agent: string;
+  routing_decision: RoutingDecision | null;
+};
+type RoutingDecision = {
+  task_type: "read_only_analysis" | "development";
+  complexity_reason: string;
+  workflow: "read_only" | "simple" | "full";
+  required_stages: string[];
 };
 type Provider = {
   id: string;
@@ -76,6 +83,7 @@ type StageRun = {
   stage: string;
   agent: string;
   status: string;
+  input_summary: string;
   output: string | null;
 };
 type ContextUsage = {
@@ -150,8 +158,9 @@ function App() {
     void load();
   }, []);
   const refreshTaskWorkflow = async (taskId: string) => {
-    const [task, stages, context] = await Promise.all([
+    const [task, taskMessages, stages, context] = await Promise.all([
       api<Task>(`/api/tasks/${taskId}`),
+      api<TaskMessage[]>(`/api/tasks/${taskId}/messages`),
       api<StageRun[]>(`/api/tasks/${taskId}/stages`),
       api<ContextUsage>(`/api/tasks/${taskId}/context`),
     ]);
@@ -159,6 +168,7 @@ function App() {
     setTasks((items) =>
       items.map((item) => (item.id === task.id ? task : item)),
     );
+    setMessages(taskMessages);
     setStageRuns(stages);
     setContextUsage(context);
   };
@@ -525,21 +535,27 @@ function App() {
                     <p>描述你想完成的工作，Agent 会保留对话上下文。</p>
                   </div>
                 )}
-                {messages.map((message) => (
-                  <article
-                    className={`message ${message.role}`}
-                    key={message.id}
-                  >
-                    <div className="message-role">
-                      {message.role === "user" ? "你" : "Agent"}
-                    </div>
-                    {message.role === "assistant" ? (
-                      <MarkdownContent content={message.content} taskId={selected.id} />
-                    ) : (
-                      <p>{message.content}</p>
-                    )}
-                  </article>
-                ))}
+                {messages.map((message) => {
+                  const stageRun = message.role === "assistant"
+                    ? stageRuns.find((run) => run.output === message.content)
+                    : undefined;
+                  return (
+                    <article
+                      className={`message ${message.role}`}
+                      key={message.id}
+                    >
+                      <div className="message-role">
+                        {message.role === "user" ? "你" : "Agent"}
+                      </div>
+                      {stageRun && <StageRunTrace run={stageRun} task={selected} />}
+                      {message.role === "assistant" ? (
+                        <MarkdownContent content={message.content} taskId={selected.id} />
+                      ) : (
+                        <p>{message.content}</p>
+                      )}
+                    </article>
+                  );
+                })}
                 {runs.map((run) => (
                   <RunOutput
                     key={run.id}
@@ -794,6 +810,70 @@ function MarkdownContent({
         {content}
       </ReactMarkdown>
     </div>
+  );
+}
+
+const stageAgents: Record<string, string> = {
+  "阅读分析": "阅读 Agent",
+  "需求分析": "主 Agent",
+  "概要设计": "阅读 Agent",
+  "详细设计": "阅读 Agent",
+  "编码实现": "执行 Agent",
+  "代码审核": "审查 Agent",
+  "单元测试": "测试 Agent",
+};
+
+function workflowStageState(stage: string, task: Task, plannedStages: string[]) {
+  const currentIndex = plannedStages.indexOf(task.current_stage);
+  const stageIndex = plannedStages.indexOf(stage);
+  if (task.current_stage === "已完成") return "已完成";
+  if (task.current_stage === "待编码确认" && stage === "编码实现") return "等待编码确认";
+  if (currentIndex >= 0 && stageIndex < currentIndex) return "已完成";
+  if (currentIndex >= 0 && stageIndex === currentIndex)
+    return task.status === "awaiting_input" ? "等待继续" : "进行中";
+  return "待执行";
+}
+
+function StageRunTrace({ run, task }: { run: StageRun; task: Task }) {
+  const decision = task.routing_decision;
+  const plannedStages = decision?.required_stages ?? [run.stage];
+  return (
+    <details className="activity-trace completed-trace">
+      <summary>
+        <Activity size={15} /> 工作过程
+      </summary>
+      <div>
+        {decision && (
+          <div className="workflow-plan">
+            <p className="workflow-plan-title">主 Agent 协作计划</p>
+            <p className="workflow-plan-reason">{decision.complexity_reason}</p>
+            <ol className="workflow-stages">
+              <li className="workflow-step completed">
+                <CircleDot size={14} />
+                <span><strong>主 Agent · 协作规划</strong>已完成</span>
+              </li>
+              {plannedStages.map((stage) => {
+                const state = workflowStageState(stage, task, plannedStages);
+                return (
+                  <li className={`workflow-step ${state === "已完成" ? "completed" : state === "待执行" ? "pending" : "current"}`} key={stage}>
+                    <CircleDot size={14} />
+                    <span><strong>{stageAgents[stage] ?? "Agent"} · {stage}</strong>{state}</span>
+                  </li>
+                );
+              })}
+            </ol>
+          </div>
+        )}
+        <p className="activity agent">
+          <CircleDot size={14} />
+          <span>
+            <strong>{run.agent} · {run.stage}</strong>
+            {run.status === "completed" ? "已完成" : "进行中"}
+          </span>
+        </p>
+        {run.input_summary && <p className="stage-run-input">{run.input_summary}</p>}
+      </div>
+    </details>
   );
 }
 
