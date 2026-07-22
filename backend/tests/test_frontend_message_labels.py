@@ -22,11 +22,11 @@ def test_agent_messages_have_a_distinct_visual_container() -> None:
     assert "border-left: 3px solid #78a99d" in source
 
 
-def test_completed_streaming_run_is_removed_after_history_refresh() -> None:
+def test_completed_streaming_run_is_restored_after_history_refresh() -> None:
     source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
 
     assert "await refreshTaskWorkflow(taskId);" in source
-    assert "setRuns((items) => items.filter((run) => run.id !== runId));" in source
+    assert "setRuns(restoreAgentRuns(agentRuns));" in source
 
 
 def test_frontend_does_not_render_a_workflow_write_status() -> None:
@@ -69,4 +69,21 @@ def test_streaming_run_receives_and_renders_the_master_workflow_before_completio
     assert 'if (eventName === "workflow")' in source
     assert "workflow: payload" in source
     assert "function AgentFlow" in source
-    assert "{run.workflow && <AgentFlow decision={run.workflow} />}" in source
+    assert "{run.workflow && <AgentFlow decision={run.workflow} activeAgent={run.activeAgent} />}" in source
+
+
+def test_agent_flow_highlights_only_the_current_agent() -> None:
+    source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+    styles = (Path(__file__).parents[2] / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
+
+    assert 'agent === activeAgent ? "active" : ""' in source
+    assert ".workflow-agent.active { font-weight: 700; }" in styles
+    assert ".workflow-agent-flow" in styles and "font-weight: 400" in styles
+
+
+def test_failed_agent_runs_are_restored_after_a_refresh() -> None:
+    source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+
+    assert "function restoreAgentRuns" in source
+    assert 'api<AgentRun[]>(`/api/tasks/${selected.id}/agent-runs`)' in source
+    assert '.filter((run) => run.status !== "completed" || (run.result.stages?.length ?? 0) > 0)' in source

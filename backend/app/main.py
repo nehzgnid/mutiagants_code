@@ -4,11 +4,14 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import time
 import uuid
 import asyncio
 import hashlib
+import difflib
+import threading
+import queue
+import signal
 from math import ceil
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -22,7 +25,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, create_engine, inspect, select
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, create_engine, inspect, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
@@ -133,7 +136,56 @@ class TaskMcpTool(Base):
     access_mode: Mapped[str] = mapped_column(String)
 
 
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id"))
+    status: Mapped[str] = mapped_column(String)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ExecutionOperation(Base):
+    __tablename__ = "execution_operations"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id"))
+    agent_run_id: Mapped[str | None] = mapped_column(ForeignKey("agent_runs.id"), nullable=True)
+    kind: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String)
+    request: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ExecutionEvent(Base):
+    __tablename__ = "execution_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id"))
+    operation_id: Mapped[str | None] = mapped_column(ForeignKey("execution_operations.id"), nullable=True)
+    kind: Mapped[str] = mapped_column(String)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class TaskAccessGrant(Base):
+    __tablename__ = "task_access_grants"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id"))
+    path: Mapped[str] = mapped_column(String)
+    access_mode: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 Base.metadata.create_all(engine)
+
+
+def is_legacy_coding_mcp(server: McpServer) -> bool:
+    """Identify the removed built-in workspace server regardless of where its script path was stored."""
+    values = [server.command, *(server.arguments or [])]
+    return any(Path(str(value)).name.lower() == "builtin_coding_mcp.py" for value in values)
 
 
 def migrate_schema() -> None:
@@ -159,6 +211,23 @@ def migrate_schema() -> None:
     if "context_compacted" not in message_columns:
         with engine.begin() as connection:
             connection.exec_driver_sql("ALTER TABLE task_messages ADD COLUMN context_compacted BOOLEAN NOT NULL DEFAULT 0")
+    agent_run_columns = {column["name"] for column in inspect(engine).get_columns("agent_runs")}
+    if "result" not in agent_run_columns:
+        with engine.begin() as connection:
+            connection.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN result JSON NOT NULL DEFAULT '{}'")
+    # The built-in coding MCP was replaced by the host executor. Remove stale records
+    # left in existing local databases so they cannot launch a deleted script.
+    with SessionLocal() as db:
+        legacy_servers = [
+            server for server in db.scalars(select(McpServer))
+            if is_legacy_coding_mcp(server)
+        ]
+        for server in legacy_servers:
+            for binding in db.scalars(select(TaskMcpTool).where(TaskMcpTool.server_id == server.id)):
+                db.delete(binding)
+            db.delete(server)
+        if legacy_servers:
+            db.commit()
 
 
 migrate_schema()
@@ -166,6 +235,17 @@ migrate_schema()
 
 def now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def recover_interrupted_operations() -> None:
+    """A process registry is in-memory, so persisted in-flight work cannot survive a restart."""
+    with SessionLocal() as db:
+        interrupted = list(db.scalars(select(ExecutionOperation).where(ExecutionOperation.status.in_({"queued", "running"}))))
+        for operation in interrupted:
+            operation.status = "failed"; operation.updated_at = now()
+            operation.result = {**(operation.result or {}), "interrupted": True, "message": "Host restarted before the operation completed."}
+            record_execution_event(db, operation.task_id, "failed", operation.result, operation.id)
+        if interrupted: db.commit()
 
 
 def dump_task(item: Task) -> dict[str, Any]:
@@ -366,6 +446,17 @@ def next_stage(task: Task, completed_stage: str) -> str:
     return completed_stage
 
 
+def can_continue_automatically(task: Task) -> bool:
+    decision = task.routing_decision or {}
+    stages = decision.get("required_stages") if isinstance(decision, dict) else None
+    return (
+        task.execution_mode == "automatic"
+        and task.status == "awaiting_input"
+        and isinstance(stages, list)
+        and task.current_stage in stages
+    )
+
+
 def start_stage(db: Session, task: Task, stage: str, content: str) -> StageRun:
     task.current_stage = stage
     task.assigned_agent = STAGE_AGENTS.get(stage, "主 Agent")
@@ -451,13 +542,6 @@ def dump_provider(item: ModelProvider) -> dict[str, Any]:
 
 MCP_ACCESS_MODES = {"read-only", "workspace-write", "full-access"}
 MCP_TIMEOUT_SECONDS = 30
-BUILTIN_CODING_MCP_NAME = "预制编码工作区工具"
-BUILTIN_CODING_MCP_SCRIPT = Path(__file__).with_name("builtin_coding_mcp.py")
-BUILTIN_CODING_ACCESS_MODES = {
-    "list_workspace_files": "read-only",
-    "read_workspace_file": "read-only",
-    "write_workspace_file": "workspace-write",
-}
 
 
 def dump_mcp_server(item: McpServer) -> dict[str, Any]:
@@ -519,10 +603,7 @@ def discover_mcp_tools(server: McpServer) -> list[dict[str, Any]]:
 
 def classify_mcp_tools(server: McpServer, discovered: list[dict[str, Any]]) -> list[dict[str, Any]]:
     existing_modes = {str(tool.get("name")): mcp_tool_access_mode(server, tool) for tool in (server.tools or [])}
-    return [{**tool, "access_mode": (
-        BUILTIN_CODING_ACCESS_MODES.get(tool["name"], "read-only")
-        if server.name == BUILTIN_CODING_MCP_NAME else existing_modes.get(tool["name"], "read-only")
-    )} for tool in discovered]
+    return [{**tool, "access_mode": existing_modes.get(tool["name"], "read-only")} for tool in discovered]
 
 
 def api_root(base_url: str) -> str:
@@ -592,6 +673,192 @@ def resolve_tool_path(workspace_path: str | None, requested_path: str, permissio
     return target
 
 
+def file_digest(content: str | None) -> str | None:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest() if content is not None else None
+
+
+def operation_payload(operation: ExecutionOperation) -> dict[str, Any]:
+    return {"id": operation.id, "task_id": operation.task_id, "kind": operation.kind,
+            "status": operation.status, "request": operation.request or {}, "result": operation.result,
+            "created_at": operation.created_at.isoformat(), "updated_at": operation.updated_at.isoformat()}
+
+
+def record_execution_event(db: Session, task_id: str, kind: str, payload: dict[str, Any], operation_id: str | None = None) -> None:
+    db.add(ExecutionEvent(task_id=task_id, operation_id=operation_id, kind=kind, payload=payload, created_at=now()))
+
+
+def update_agent_run(run_id: str, task_id: str, *, activity: dict[str, Any] | None = None,
+                     token: str | None = None, file: dict[str, Any] | None = None,
+                     error: str | None = None, workflow: dict[str, Any] | None = None,
+                     status: str | None = None) -> None:
+    """Persist the user-visible stream so a disconnect or refresh can recover it."""
+    with SessionLocal() as db:
+        run = db.get(AgentRun, run_id)
+        if not run:
+            return
+        result = dict(run.result or {})
+        if activity:
+            result["activities"] = [*(result.get("activities") or []), activity]
+        if token:
+            result["content"] = f"{result.get('content', '')}{token}"
+        if file:
+            result["files"] = [*(result.get("files") or []), file]
+        if workflow:
+            result["workflow"] = workflow
+        if error:
+            result["error"] = error
+        run.result = result
+        if status:
+            run.status = status
+        run.updated_at = now()
+        record_execution_event(db, task_id, "agent_run", {"run_id": run_id, "status": run.status, "result": result})
+        db.commit()
+
+
+def update_agent_run_stage(run_id: str, task_id: str, stage: str, agent: str, status: str,
+                           output: str | None = None) -> None:
+    with SessionLocal() as db:
+        run = db.get(AgentRun, run_id)
+        if not run:
+            return
+        result = dict(run.result or {})
+        stages = list(result.get("stages") or [])
+        entry = {"stage": stage, "agent": agent, "status": status}
+        if output is not None:
+            entry["output"] = output
+        if stages and stages[-1].get("stage") == stage and stages[-1].get("status") == "running":
+            stages[-1] = {**stages[-1], **entry}
+        else:
+            stages.append(entry)
+        result["stages"] = stages
+        run.result = result
+        run.updated_at = now()
+        record_execution_event(db, task_id, "agent_stage", {"run_id": run_id, **entry})
+        db.commit()
+
+
+recover_interrupted_operations()
+
+
+def task_accessible_path(db: Session, task: Task, requested_path: str, write: bool = False) -> Path:
+    root = Path(task.worktree_path or "").resolve()
+    candidate = Path(requested_path).expanduser()
+    target = (candidate if candidate.is_absolute() else root / candidate).resolve()
+    if target.is_relative_to(root):
+        return target
+    required_mode = "workspace-write" if write else "read-only"
+    for grant in db.scalars(select(TaskAccessGrant).where(TaskAccessGrant.task_id == task.id)):
+        granted_root = Path(grant.path).resolve()
+        if target.is_relative_to(granted_root) and (grant.access_mode == "full-access" or grant.access_mode == required_mode):
+            return target
+    raise ValueError("The requested external path has not been explicitly authorized for this task.")
+
+
+def patch_preview(task: Task, db: Session, edits: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    prepared: list[dict[str, Any]] = []
+    snapshots: dict[str, Any] = {}
+    for edit in edits:
+        path = str(edit["path"])
+        target = task_accessible_path(db, task, path, write=True)
+        before = target.read_text(encoding="utf-8") if target.exists() else None
+        expected_hash = edit.get("expected_hash")
+        if expected_hash is not None and expected_hash != file_digest(before):
+            raise RuntimeError(json.dumps({"path": path, "current_hash": file_digest(before), "reason": "base_changed"}))
+        old_text = edit.get("old_text")
+        new_text = edit.get("new_text", "")
+        if old_text is None:
+            if before is not None:
+                raise ValueError(f"File already exists: {path}")
+            after = new_text
+        else:
+            if before is None or old_text not in before:
+                raise RuntimeError(json.dumps({"path": path, "current_hash": file_digest(before), "reason": "text_not_found"}))
+            if before.count(old_text) != 1:
+                raise ValueError(f"Patch text is ambiguous in {path}.")
+            after = before.replace(old_text, new_text, 1)
+        diff = "".join(difflib.unified_diff((before or "").splitlines(keepends=True), after.splitlines(keepends=True),
+                                            fromfile=f"a/{path}", tofile=f"b/{path}"))
+        prepared.append({"path": path, "target": target, "before": before, "after": after, "diff": diff})
+        snapshots[path] = {"before": before, "before_hash": file_digest(before), "after_hash": file_digest(after)}
+    return prepared, snapshots
+
+
+def apply_prepared_patch(prepared: list[dict[str, Any]]) -> None:
+    for item in prepared:
+        target: Path = item["target"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text(item["after"], encoding="utf-8")
+        temporary.replace(target)
+
+
+def execute_patch_operation(db: Session, operation: ExecutionOperation) -> None:
+    task = db.get(Task, operation.task_id)
+    assert task is not None
+    try:
+        prepared, snapshot = patch_preview(task, db, list((operation.request or {}).get("edits", [])))
+    except RuntimeError as error:
+        operation.status = "conflict"; operation.result = json.loads(str(error)); operation.updated_at = now()
+        record_execution_event(db, task.id, "conflict", operation.result, operation.id)
+        return
+    apply_prepared_patch(prepared)
+    operation.status = "completed"; operation.snapshot = snapshot
+    operation.result = {"files": [{"path": item["path"], "diff": item["diff"]} for item in prepared]}
+    operation.updated_at = now()
+    record_execution_event(db, task.id, "completed", operation.result, operation.id)
+
+
+PROCESS_LOCK = threading.Lock()
+ACTIVE_PROCESSES: dict[str, subprocess.Popen[str]] = {}
+
+
+def append_command_output(operation_id: str, task_id: str, stream: str, content: str) -> None:
+    with SessionLocal() as db:
+        operation = db.get(ExecutionOperation, operation_id)
+        if not operation or operation.status == "canceled":
+            return
+        result = dict(operation.result or {})
+        result[stream] = (result.get(stream, "") + content)[-100_000:]
+        operation.result = result; operation.updated_at = now()
+        record_execution_event(db, task_id, "output", {"stream": stream, "content": content}, operation_id)
+        db.commit()
+
+
+def run_command_operation(operation_id: str) -> None:
+    with SessionLocal() as db:
+        operation = db.get(ExecutionOperation, operation_id)
+        if not operation or operation.status == "canceled": return
+        task = db.get(Task, operation.task_id)
+        assert task is not None
+        request = operation.request or {}; cwd = task_accessible_path(db, task, str(request.get("working_directory", ".")))
+        command = str(request["command"])
+        operation.status = "running"; operation.result = {"stdout": "", "stderr": ""}; operation.updated_at = now()
+        record_execution_event(db, task.id, "started", {"command": command}, operation.id); db.commit()
+    shell_command = ["cmd.exe", "/d", "/s", "/c", command] if os.name == "nt" else ["/bin/sh", "-lc", command]
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    process = subprocess.Popen(shell_command, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               creationflags=flags, start_new_session=os.name != "nt")
+    with PROCESS_LOCK: ACTIVE_PROCESSES[operation_id] = process
+    readers = [threading.Thread(target=lambda pipe, name: [append_command_output(operation_id, task.id, name, line) for line in iter(pipe.readline, "")], args=(process.stdout, "stdout")),
+               threading.Thread(target=lambda pipe, name: [append_command_output(operation_id, task.id, name, line) for line in iter(pipe.readline, "")], args=(process.stderr, "stderr"))]
+    for reader in readers: reader.start()
+    timeout = min(max(int(request.get("timeout_seconds", 60)), 1), 1800)
+    try:
+        returncode = process.wait(timeout=timeout); status = "completed" if returncode == 0 else "failed"
+    except subprocess.TimeoutExpired:
+        process.kill(); returncode = None; status = "failed"
+    for reader in readers: reader.join(timeout=2)
+    with PROCESS_LOCK: ACTIVE_PROCESSES.pop(operation_id, None)
+    with SessionLocal() as db:
+        operation = db.get(ExecutionOperation, operation_id)
+        if not operation: return
+        if operation.status != "canceled":
+            result = dict(operation.result or {}); result.update({"returncode": returncode, "timed_out": returncode is None})
+            operation.status = status; operation.result = result; operation.updated_at = now()
+            record_execution_event(db, operation.task_id, status, result, operation.id)
+        db.commit()
+
+
 def list_local_files(task: Task, arguments: dict[str, Any]) -> str:
     target = resolve_tool_path(task.worktree_path, str(arguments.get("path", ".")), task.permission_mode)
     if not target.is_dir():
@@ -615,38 +882,42 @@ def read_local_file(task: Task, arguments: dict[str, Any]) -> str:
     return json.dumps({"path": str(target), "content": content[:100_000], "truncated": len(content) > 100_000}, ensure_ascii=False)
 
 
-def write_local_file(task: Task, arguments: dict[str, Any]) -> str:
+def apply_local_patch(task: Task, arguments: dict[str, Any], db: Session) -> str:
     if not write_enabled(task):
         raise ValueError("The current task stage or permission does not allow file changes.")
-    target = resolve_tool_path(task.worktree_path, str(arguments["path"]), task.permission_mode)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(str(arguments["content"]), encoding="utf-8")
-    return json.dumps({"path": str(target), "written": True}, ensure_ascii=False)
-
-
-def run_local_command(task: Task, arguments: dict[str, Any]) -> str:
-    if task.permission_mode != "full-access":
-        raise ValueError("Only full-access mode allows command execution.")
-    working_directory = resolve_tool_path(task.worktree_path, str(arguments.get("working_directory", ".")), task.permission_mode)
-    if not working_directory.is_dir():
-        raise ValueError("The working directory is not a directory.")
-    result = subprocess.run(str(arguments["command"]), shell=True, cwd=working_directory, text=True,
-                            capture_output=True, timeout=60, check=False)
-    return json.dumps({"returncode": result.returncode, "stdout": result.stdout[-20_000:], "stderr": result.stderr[-20_000:]}, ensure_ascii=False)
+    edits = arguments.get("edits")
+    if not isinstance(edits, list) or not edits:
+        raise ValueError("apply_patch requires at least one edit.")
+    operation = ExecutionOperation(id=str(uuid.uuid4()), task_id=task.id, kind="patch", status="queued",
+                                   request={"edits": edits}, created_at=now(), updated_at=now())
+    db.add(operation)
+    if task.execution_mode == "manual_confirmation":
+        try:
+            prepared, _ = patch_preview(task, db, edits)
+            operation.status = "pending_approval"
+            operation.result = {"files": [{"path": item["path"], "diff": item["diff"]} for item in prepared]}
+            record_execution_event(db, task.id, "approval_required", operation.result, operation.id)
+        except RuntimeError as error:
+            operation.status = "conflict"; operation.result = json.loads(str(error))
+            record_execution_event(db, task.id, "conflict", operation.result, operation.id)
+    else:
+        execute_patch_operation(db, operation)
+    db.commit()
+    return json.dumps(operation_payload(operation), ensure_ascii=False)
 
 
 BASE_TOOLS = [
     {"type": "function", "function": {"name": "list_files", "description": "List files below an authorized local directory.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path or path relative to the task code directory."}}, "required": []}}},
     {"type": "function", "function": {"name": "read_file", "description": "Read a UTF-8 text file from an authorized local path.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
 ]
-WRITE_TOOL = {"type": "function", "function": {"name": "write_file", "description": "Create or replace a UTF-8 text file at an authorized local path.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}}
-COMMAND_TOOL = {"type": "function", "function": {"name": "run_command", "description": "Run a local shell command. Available only after the user selected full access.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "working_directory": {"type": "string"}}, "required": ["command"]}}}
+PATCH_TOOL = {"type": "function", "function": {"name": "apply_patch", "description": "Atomically apply precise text edits. Read files first and supply their SHA-256 content hash as expected_hash. In manual confirmation mode the patch waits for user approval.", "parameters": {"type": "object", "properties": {"edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "expected_hash": {"type": ["string", "null"]}, "old_text": {"type": ["string", "null"]}, "new_text": {"type": "string"}}, "required": ["path", "expected_hash", "old_text", "new_text"]}}}, "required": ["edits"]}}}
+COMMAND_TOOL = {"type": "function", "function": {"name": "run_command", "description": "Start a local command with streamed output. Available only after the user selected full access.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "working_directory": {"type": "string"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800}}, "required": ["command"]}}}
 
 
 def tools_for(permission_mode: str) -> list[dict[str, Any]]:
     tools = list(BASE_TOOLS)
     if permission_mode in {"workspace-write", "full-access"}:
-        tools.append(WRITE_TOOL)
+        tools.append(PATCH_TOOL)
     if permission_mode == "full-access":
         tools.append(COMMAND_TOOL)
     return tools
@@ -701,7 +972,18 @@ def tools_for_task(task: Task, db: Session | None = None) -> list[dict[str, Any]
 
 
 def execute_tool(task: Task, name: str, arguments: dict[str, Any], db: Session | None = None) -> str:
-    handlers = {"list_files": list_local_files, "read_file": read_local_file, "write_file": write_local_file, "run_command": run_local_command}
+    if name == "apply_patch":
+        if not db: raise ValueError("apply_patch requires a database session.")
+        return apply_local_patch(task, arguments, db)
+    if name == "run_command":
+        if not db: raise ValueError("run_command requires a database session.")
+        if task.permission_mode != "full-access": raise ValueError("Only full-access mode allows command execution.")
+        operation = ExecutionOperation(id=str(uuid.uuid4()), task_id=task.id, kind="command", status="queued",
+                                       request=dict(arguments), created_at=now(), updated_at=now())
+        db.add(operation); record_execution_event(db, task.id, "queued", {"command": arguments.get("command", "")}, operation.id); db.commit()
+        threading.Thread(target=run_command_operation, args=(operation.id,), daemon=True).start()
+        return json.dumps(operation_payload(operation), ensure_ascii=False)
+    handlers = {"list_files": list_local_files, "read_file": read_local_file}
     handler = handlers.get(name)
     if handler:
         return handler(task, arguments)
@@ -718,7 +1000,7 @@ def execute_tool(task: Task, name: str, arguments: dict[str, Any], db: Session |
                 return asyncio.run(mcp_call_tool_async(server, tool_name, arguments, {
                     "LOCAL_AGENT_WORKSPACE": task.worktree_path or "",
                 }))
-            except (OSError, asyncio.TimeoutError, ValueError) as error:
+            except Exception as error:
                 raise ValueError(f"MCP Server {server.name} 调用失败：{error}") from error
     raise ValueError(f"Unsupported tool: {name}")
 
@@ -746,7 +1028,7 @@ class PermissionInput(BaseModel):
 
 
 class ExecutionModeInput(BaseModel):
-    execution_mode: Literal["confirm_before_coding", "automatic"]
+    execution_mode: Literal["confirm_before_coding", "automatic", "manual_confirmation"]
 
 
 class TaskMcpToolInput(BaseModel):
@@ -758,12 +1040,36 @@ class TaskMcpToolInput(BaseModel):
 class TaskUpdateInput(BaseModel):
     title: str = Field(min_length=1, max_length=120)
     permission_mode: str = Field(pattern="^(read-only|workspace-write|full-access)$")
-    execution_mode: Literal["confirm_before_coding", "automatic"] | None = None
+    execution_mode: Literal["confirm_before_coding", "automatic", "manual_confirmation"] | None = None
     mcp_tools: list[TaskMcpToolInput] | None = Field(default=None, max_length=100)
 
 
 class MessageInput(BaseModel):
-    content: str = Field(min_length=1, max_length=20000)
+    content: str = Field(default="", max_length=20000)
+    continuation: bool = False
+
+
+class PatchInput(BaseModel):
+    edits: list[dict[str, Any]] = Field(min_length=1, max_length=100)
+
+
+class CommandInput(BaseModel):
+    command: str = Field(min_length=1, max_length=20_000)
+    working_directory: str = "."
+    timeout_seconds: int = Field(default=60, ge=1, le=1800)
+
+
+class ApprovalInput(BaseModel):
+    approve: bool
+
+
+class AccessGrantInput(BaseModel):
+    path: str = Field(min_length=1, max_length=2000)
+    access_mode: Literal["read-only", "workspace-write", "full-access"]
+
+
+class CommitInput(BaseModel):
+    message: str = Field(min_length=1, max_length=500)
 
 
 CONTEXT_TOKEN_LIMIT = 128_000
@@ -914,28 +1220,6 @@ def create_mcp_server(payload: McpServerInput) -> dict[str, Any]:
             raise HTTPException(422, str(error)) from error
         db.commit()
         return dump_mcp_server(server)
-
-
-@app.post("/api/mcp-servers/presets/coding", status_code=201)
-def create_builtin_coding_mcp_server() -> dict[str, Any]:
-    """Register the bundled workspace MCP Server once for all tasks."""
-    with SessionLocal() as db:
-        existing = db.scalar(select(McpServer).where(McpServer.name == BUILTIN_CODING_MCP_NAME))
-        if existing:
-            return {"created": False, "server": dump_mcp_server(existing)}
-        server = McpServer(
-            id=str(uuid.uuid4()), name=BUILTIN_CODING_MCP_NAME, command=sys.executable,
-            arguments=[str(BUILTIN_CODING_MCP_SCRIPT)], enabled=True, tools=[], created_at=now(), updated_at=now(),
-        )
-        db.add(server)
-        try:
-            discovered = discover_mcp_tools(server)
-        except ValueError as error:
-            db.rollback()
-            raise HTTPException(422, str(error)) from error
-        server.tools = classify_mcp_tools(server, discovered)
-        db.commit()
-        return {"created": True, "server": dump_mcp_server(server)}
 
 
 @app.put("/api/mcp-servers/{server_id}")
@@ -1105,6 +1389,174 @@ def update_task(task_id: str, payload: TaskUpdateInput) -> dict[str, Any]:
         return dump_task(task)
 
 
+@app.get("/api/tasks/{task_id}/operations")
+def list_execution_operations(task_id: str) -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        if not db.get(Task, task_id): raise HTTPException(404, "Task not found")
+        return [operation_payload(item) for item in db.scalars(select(ExecutionOperation).where(
+            ExecutionOperation.task_id == task_id).order_by(ExecutionOperation.created_at.desc()))]
+
+
+@app.get("/api/tasks/{task_id}/agent-runs")
+def list_agent_runs(task_id: str) -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        if not db.get(Task, task_id): raise HTTPException(404, "Task not found")
+        return [{"id": run.id, "status": run.status, "result": run.result or {}, "created_at": run.created_at.isoformat(), "updated_at": run.updated_at.isoformat()}
+                for run in db.scalars(select(AgentRun).where(AgentRun.task_id == task_id).order_by(AgentRun.created_at.desc()))]
+
+
+@app.get("/api/tasks/{task_id}/events")
+def stream_execution_events(task_id: str, after_id: int = 0) -> StreamingResponse:
+    with SessionLocal() as db:
+        if not db.get(Task, task_id):
+            raise HTTPException(404, "Task not found")
+    def event_stream():
+        cursor = after_id
+        idle = 0
+        while idle < 150:
+            with SessionLocal() as db:
+                events = list(db.scalars(select(ExecutionEvent).where(ExecutionEvent.task_id == task_id,
+                    ExecutionEvent.id > cursor).order_by(ExecutionEvent.id)))
+            if events:
+                idle = 0
+                for event in events:
+                    cursor = event.id
+                    yield sse("execution", {"id": event.id, "operation_id": event.operation_id, "kind": event.kind,
+                                            "payload": event.payload or {}, "created_at": event.created_at.isoformat()})
+            else:
+                idle += 1; yield ": keepalive\n\n"; time.sleep(1)
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+@app.post("/api/tasks/{task_id}/patches", status_code=201)
+def create_patch_operation(task_id: str, payload: PatchInput) -> dict[str, Any]:
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        if not task: raise HTTPException(404, "Task not found")
+        if not write_enabled(task): raise HTTPException(409, "The current task stage or permission does not allow file changes")
+        operation = ExecutionOperation(id=str(uuid.uuid4()), task_id=task.id, kind="patch", status="queued",
+                                       request={"edits": payload.edits}, created_at=now(), updated_at=now())
+        db.add(operation)
+        if task.execution_mode == "manual_confirmation":
+            try:
+                prepared, _ = patch_preview(task, db, payload.edits)
+                operation.status = "pending_approval"; operation.result = {"files": [{"path": item["path"], "diff": item["diff"]} for item in prepared]}
+                record_execution_event(db, task.id, "approval_required", operation.result, operation.id)
+            except RuntimeError as error:
+                operation.status = "conflict"; operation.result = json.loads(str(error)); record_execution_event(db, task.id, "conflict", operation.result, operation.id)
+        else:
+            execute_patch_operation(db, operation)
+        db.commit(); return operation_payload(operation)
+
+
+@app.post("/api/tasks/{task_id}/commands", status_code=201)
+def create_command_operation(task_id: str, payload: CommandInput) -> dict[str, Any]:
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        if not task: raise HTTPException(404, "Task not found")
+        if task.permission_mode != "full-access": raise HTTPException(409, "Only full-access mode allows command execution")
+        try: task_accessible_path(db, task, payload.working_directory)
+        except ValueError as error: raise HTTPException(403, str(error)) from error
+        operation = ExecutionOperation(id=str(uuid.uuid4()), task_id=task.id, kind="command", status="queued",
+                                       request=payload.model_dump(), created_at=now(), updated_at=now())
+        db.add(operation); record_execution_event(db, task.id, "queued", {"command": payload.command}, operation.id); db.commit()
+        threading.Thread(target=run_command_operation, args=(operation.id,), daemon=True).start()
+        return operation_payload(operation)
+
+
+@app.post("/api/tasks/{task_id}/operations/{operation_id}/approval")
+def approve_operation(task_id: str, operation_id: str, payload: ApprovalInput) -> dict[str, Any]:
+    with SessionLocal() as db:
+        operation = db.get(ExecutionOperation, operation_id)
+        if not operation or operation.task_id != task_id: raise HTTPException(404, "Operation not found")
+        if operation.status != "pending_approval": raise HTTPException(409, "Operation is not awaiting approval")
+        if not payload.approve:
+            operation.status = "canceled"; operation.updated_at = now(); record_execution_event(db, task_id, "canceled", {}, operation.id); db.commit(); return operation_payload(operation)
+        execute_patch_operation(db, operation); db.commit(); return operation_payload(operation)
+
+
+@app.post("/api/tasks/{task_id}/operations/{operation_id}/cancel")
+def cancel_operation(task_id: str, operation_id: str) -> dict[str, Any]:
+    with SessionLocal() as db:
+        operation = db.get(ExecutionOperation, operation_id)
+        if not operation or operation.task_id != task_id: raise HTTPException(404, "Operation not found")
+        if operation.status not in {"queued", "running", "pending_approval"}: raise HTTPException(409, "Operation cannot be canceled")
+        with PROCESS_LOCK:
+            process = ACTIVE_PROCESSES.get(operation.id)
+        if process and process.poll() is None:
+            if os.name == "nt": process.send_signal(signal.CTRL_BREAK_EVENT)
+            else: os.killpg(process.pid, signal.SIGTERM)
+        operation.status = "canceled"; operation.updated_at = now(); record_execution_event(db, task_id, "canceled", {}, operation.id); db.commit()
+        return operation_payload(operation)
+
+
+@app.post("/api/tasks/{task_id}/operations/{operation_id}/undo")
+def undo_patch_operation(task_id: str, operation_id: str) -> dict[str, Any]:
+    with SessionLocal() as db:
+        operation = db.get(ExecutionOperation, operation_id)
+        task = db.get(Task, task_id)
+        if not operation or not task or operation.task_id != task_id or operation.kind != "patch": raise HTTPException(404, "Patch operation not found")
+        if operation.status != "completed" or not operation.snapshot: raise HTTPException(409, "Only completed patch operations can be undone")
+        conflicts = []
+        for path, state in operation.snapshot.items():
+            current = task_accessible_path(db, task, path, write=True)
+            content = current.read_text(encoding="utf-8") if current.exists() else None
+            if file_digest(content) != state["after_hash"]: conflicts.append(path)
+        if conflicts: raise HTTPException(409, {"message": "Files changed after this operation", "paths": conflicts})
+        for path, state in operation.snapshot.items():
+            target = task_accessible_path(db, task, path, write=True)
+            if state["before"] is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True); target.write_text(state["before"], encoding="utf-8")
+        operation.status = "undone"; operation.updated_at = now(); record_execution_event(db, task_id, "undone", {"paths": list(operation.snapshot)}, operation.id); db.commit()
+        return operation_payload(operation)
+
+
+@app.post("/api/tasks/{task_id}/access-grants", status_code=201)
+def create_access_grant(task_id: str, payload: AccessGrantInput) -> dict[str, Any]:
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        if not task: raise HTTPException(404, "Task not found")
+        path = Path(payload.path).expanduser().resolve()
+        if not path.exists() or not path.is_dir(): raise HTTPException(422, "Authorized path must be an existing directory")
+        grant = TaskAccessGrant(id=str(uuid.uuid4()), task_id=task_id, path=str(path), access_mode=payload.access_mode, created_at=now())
+        db.add(grant); record_execution_event(db, task_id, "access_granted", {"path": str(path), "access_mode": payload.access_mode}); db.commit()
+        return {"id": grant.id, "path": grant.path, "access_mode": grant.access_mode}
+
+
+@app.get("/api/tasks/{task_id}/git")
+def get_task_git_status(task_id: str) -> dict[str, Any]:
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        if not task: raise HTTPException(404, "Task not found")
+        root = Path(task.worktree_path or "").resolve()
+        status = git(root, "status", "--porcelain=v1", "--branch")
+        diff = git(root, "diff", "--no-ext-diff", "--binary")
+        if status.returncode != 0: raise HTTPException(409, status.stderr.strip() or "Git status failed")
+        return {"status": status.stdout, "diff": diff.stdout, "branch": task.branch}
+
+
+@app.post("/api/tasks/{task_id}/git/commit", status_code=201)
+def create_task_git_commit(task_id: str, payload: CommitInput) -> dict[str, Any]:
+    with SessionLocal() as db:
+        task = db.get(Task, task_id); workspace = db.get(Workspace, task.workspace_id) if task else None
+        if not task or not workspace: raise HTTPException(404, "Task not found")
+        root = Path(task.worktree_path or "").resolve()
+        changed_paths = sorted({path for operation in db.scalars(select(ExecutionOperation).where(
+            ExecutionOperation.task_id == task_id, ExecutionOperation.kind == "patch", ExecutionOperation.status == "completed"))
+            for path in (operation.snapshot or {}).keys()})
+        if not changed_paths: raise HTTPException(409, "No completed agent patch is available to commit")
+        test = subprocess.run(workspace.test_command, cwd=root, text=True, capture_output=True, check=False, timeout=300)
+        if test.returncode != 0: raise HTTPException(409, {"message": "Tests failed; commit was not created", "stdout": test.stdout[-20_000:], "stderr": test.stderr[-20_000:]})
+        staged = git(root, "add", "--", *changed_paths)
+        if staged.returncode != 0: raise HTTPException(409, staged.stderr.strip() or "Git staging failed")
+        committed = git(root, "commit", "-m", payload.message)
+        if committed.returncode != 0: raise HTTPException(409, committed.stderr.strip() or "Git commit failed")
+        record_execution_event(db, task_id, "git_committed", {"paths": changed_paths, "message": payload.message}); db.commit()
+        return {"message": payload.message, "paths": changed_paths, "output": committed.stdout}
+
+
 @app.delete("/api/tasks/{task_id}", status_code=204)
 def delete_task(task_id: str) -> None:
     with SessionLocal() as db:
@@ -1252,7 +1704,7 @@ def view_task_file(task_id: str, path: str = Query(min_length=1)) -> FileRespons
 @app.post("/api/tasks/{task_id}/messages/stream")
 def stream_task_message(task_id: str, payload: MessageInput) -> StreamingResponse:
     content = payload.content.strip()
-    if not content:
+    if not content and not payload.continuation:
         raise HTTPException(422, "Message cannot be empty")
     with SessionLocal() as db:
         task = db.get(Task, task_id)
@@ -1261,16 +1713,24 @@ def stream_task_message(task_id: str, payload: MessageInput) -> StreamingRespons
             raise HTTPException(404, "Task not found")
         if not provider:
             raise HTTPException(409, "Configure and activate a model profile first")
-        try:
-            decision = master_agent_route(provider, task, content, routing_context(db, task)) if should_replan(task, content) else None
-        except RoutingError as error:
-            message = str(error)
-            def routing_error_stream():
-                yield sse("error", {"message": message, "retryable": True})
-            return StreamingResponse(routing_error_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
-        db.add(TaskMessage(id=str(uuid.uuid4()), task_id=task_id, role="user", content=content, created_at=now()))
+        if payload.continuation:
+            if not can_continue_automatically(task):
+                raise HTTPException(409, "This task cannot continue automatically")
+            decision = None
+        else:
+            try:
+                decision = master_agent_route(provider, task, content, routing_context(db, task)) if should_replan(task, content) else None
+            except RoutingError as error:
+                message = str(error)
+                def routing_error_stream():
+                    yield sse("error", {"message": message, "retryable": True})
+                return StreamingResponse(routing_error_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+            db.add(TaskMessage(id=str(uuid.uuid4()), task_id=task_id, role="user", content=content, created_at=now()))
         stage_run = route_message(db, task, content, decision)
         stage_run_id = stage_run.id if stage_run else None
+        agent_run = AgentRun(id=str(uuid.uuid4()), task_id=task_id, status="running", created_at=now(), updated_at=now())
+        db.add(agent_run)
+        agent_run_id = agent_run.id
         task.updated_at = now()
         db.commit()
         workflow_payload = task.routing_decision if isinstance(task.routing_decision, dict) else None
@@ -1284,12 +1744,11 @@ def stream_task_message(task_id: str, payload: MessageInput) -> StreamingRespons
         provider_url = api_root(provider.base_url)
 
     def event_stream():
-        answer = ""
-        if workflow_payload:
-            yield sse("workflow", workflow_payload)
-        yield sse("activity", {"kind": "agent", "title": task.assigned_agent, "detail": f"正在执行{task.current_stage}（{task.workflow_type}流程）"})
-        try:
+        nonlocal task, request_body, headers, stage_run_id
+        def stream_stage() -> Any:
+            answer = ""
             for _ in range(12):
+                update_agent_run(agent_run_id, task_id, activity={"kind": "network", "title": "model", "detail": "请求模型响应"})
                 yield sse("activity", {"kind": "network", "title": "网络调用", "detail": "正在请求模型响应"})
                 tool_calls: dict[int, dict[str, Any]] = {}
                 for retry in range(6):
@@ -1302,15 +1761,14 @@ def stream_task_message(task_id: str, payload: MessageInput) -> StreamingRespons
                                 data = line.removeprefix("data:").strip()
                                 if data == "[DONE]":
                                     continue
-                                chunk = json.loads(data)
-                                choices = chunk.get("choices") or []
+                                choices = (json.loads(data).get("choices") or [])
                                 if not choices:
                                     continue
-                                choice = choices[0]
-                                delta = choice.get("delta", {})
+                                delta = choices[0].get("delta", {})
                                 text = delta.get("content")
                                 if text:
                                     answer += text
+                                    update_agent_run(agent_run_id, task_id, token=text)
                                     yield sse("token", {"content": text})
                                 for call in delta.get("tool_calls", []):
                                     index = call.get("index", 0)
@@ -1332,35 +1790,66 @@ def stream_task_message(task_id: str, payload: MessageInput) -> StreamingRespons
                 if not tool_calls:
                     if not answer.strip():
                         raise ValueError("The model returned an empty response.")
-                    break
-                calls = [tool_calls[index] for index in sorted(tool_calls)]
-                request_body["messages"].append({"role": "assistant", "content": None, "tool_calls": calls})
-                for call in calls:
-                    function = call["function"]
-                    name = function["name"]
+                    return answer
+                request_body["messages"].append({"role": "assistant", "content": None, "tool_calls": [tool_calls[index] for index in sorted(tool_calls)]})
+                for call in request_body["messages"][-1]["tool_calls"]:
+                    name = call["function"]["name"]
                     try:
-                        arguments = json.loads(function["arguments"] or "{}")
+                        arguments = json.loads(call["function"]["arguments"] or "{}")
                         with SessionLocal() as tool_db:
                             current_task = tool_db.get(Task, task_id)
+                            update_agent_run(agent_run_id, task_id, activity={"kind": "tool", "title": name, "detail": "正在调用工具"})
                             yield sse("activity", {"kind": "tool", "title": "工作阶段", "detail": tool_activity_detail(tool_db, current_task, name)})
                             result = execute_tool(current_task, name, arguments, tool_db)
-                        if name == "write_file":
-                            yield sse("file", {"path": json.loads(result)["path"], "action": "已更改"})
+                        if name == "apply_patch":
+                            for edit in arguments.get("edits", []):
+                                update_agent_run(agent_run_id, task_id, file={"path": edit.get("path", ""), "action": "modified"})
+                                yield sse("file", {"path": edit.get("path", ""), "action": "已更改"})
                     except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, subprocess.SubprocessError) as error:
                         result = json.dumps({"error": str(error)})
                         yield sse("activity", {"kind": "error", "title": "工具调用失败", "detail": str(error)})
                     request_body["messages"].append({"role": "tool", "tool_call_id": call["id"], "content": result})
-            else:
-                raise ValueError("The model exceeded the local tool-call limit.")
-            with SessionLocal() as db:
-                assistant_message = TaskMessage(id=str(uuid.uuid4()), task_id=task_id, role="assistant", content=answer, created_at=now())
-                db.add(assistant_message)
-                updated_task = db.get(Task, task_id)
-                complete_stage(db, task_id, stage_run_id, answer)
-                updated_task.updated_at = now()
-                db.commit()
-                yield sse("done", {"message": dump_message(assistant_message)})
+            raise ValueError("The model exceeded the local tool-call limit.")
+
+        if workflow_payload:
+            update_agent_run(agent_run_id, task_id, workflow=workflow_payload)
+            yield sse("workflow", workflow_payload)
+        try:
+            while True:
+                stage_name, stage_agent = task.current_stage, task.assigned_agent
+                update_agent_run_stage(agent_run_id, task_id, stage_name, stage_agent, "running")
+                yield sse("stage", {"stage": stage_name, "agent": stage_agent, "status": "running"})
+                update_agent_run(agent_run_id, task_id, activity={"kind": "agent", "title": stage_agent, "detail": f"执行阶段：{stage_name}"})
+                yield sse("activity", {"kind": "agent", "title": stage_agent, "detail": f"正在执行{stage_name}（{task.workflow_type}流程）"})
+                answer = yield from stream_stage()
+                update_agent_run_stage(agent_run_id, task_id, stage_name, stage_agent, "completed", answer)
+                yield sse("stage", {"stage": stage_name, "agent": stage_agent, "status": "completed", "output": answer})
+                history.append({"role": "assistant", "content": answer})
+                with SessionLocal() as db:
+                    current_task = db.get(Task, task_id)
+                    complete_stage(db, task_id, stage_run_id, answer)
+                    continue_automatically = can_continue_automatically(current_task)
+                    if continue_automatically:
+                        next_run = start_stage(db, current_task, current_task.current_stage, "自动续跑")
+                        next_stage_run_id = next_run.id
+                    else:
+                        assistant_message = TaskMessage(id=str(uuid.uuid4()), task_id=task_id, role="assistant", content=answer, created_at=now())
+                        db.add(assistant_message)
+                        completed_run = db.get(AgentRun, agent_run_id)
+                        if completed_run:
+                            completed_run.status = "completed"
+                            completed_run.result = {**(completed_run.result or {}), "content": answer}
+                            completed_run.updated_at = now()
+                    db.commit()
+                    task = current_task
+                if not continue_automatically:
+                    yield sse("done", {"message": dump_message(assistant_message)})
+                    break
+                stage_run_id = next_stage_run_id
+                with SessionLocal() as db:
+                    request_body, headers = conversation_request(db, task, provider, history)
         except Exception as error:
+            update_agent_run(agent_run_id, task_id, error=str(error), status="failed")
             yield sse("error", {"message": str(error)})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

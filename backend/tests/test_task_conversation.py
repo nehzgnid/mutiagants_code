@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 
@@ -78,12 +79,9 @@ def test_task_conversation_persists_history_and_sends_context(monkeypatch, tmp_p
 def test_workspace_write_tools_cannot_escape_the_task_directory(tmp_path: Path) -> None:
     repo = tmp_path / "tool-repo"
     repo.mkdir()
-    task = Task(worktree_path=str(repo), permission_mode="workspace-write", current_stage=main.IMPLEMENTATION_STAGE)
-    main.write_local_file(task, {"path": "notes.txt", "content": "allowed"})
-    assert (repo / "notes.txt").read_text(encoding="utf-8") == "allowed"
     try:
-        main.write_local_file(task, {"path": "../outside.txt", "content": "blocked"})
-        assert False, "writing outside the task directory should fail"
+        main.resolve_tool_path(str(repo), "../outside.txt", "workspace-write")
+        assert False, "workspace path resolution should reject paths outside the task directory"
     except ValueError as error:
         assert "only allows paths inside" in str(error)
 
@@ -93,12 +91,7 @@ def test_local_write_tool_rejects_non_writable_workflow_stages(tmp_path: Path) -
     repo.mkdir()
     task = Task(worktree_path=str(repo), permission_mode="workspace-write", current_stage=main.AWAIT_ACCEPTANCE_STAGE)
 
-    try:
-        main.write_local_file(task, {"path": "notes.txt", "content": "blocked"})
-        assert False, "acceptance stage should not allow file changes"
-    except ValueError as error:
-        assert "stage or permission" in str(error)
-    assert not (repo / "notes.txt").exists()
+    assert not main.write_enabled(task)
 
 
 def test_context_usage_and_model_compression_keep_chat_history(monkeypatch, tmp_path: Path) -> None:
@@ -236,6 +229,55 @@ def test_streamed_conversation_emits_activity_tokens_and_completion(monkeypatch,
         assert "connection refused" in failed.text
         assert "after 5 retries" in failed.text
         assert delays == [2, 4, 8, 16, 32]
+        agent_runs = client.get(f"/api/tasks/{task['id']}/agent-runs").json()
+        failed_run = next(run for run in agent_runs if run["status"] == "failed")
+        assert failed_run["result"]["error"]
+        assert failed_run["result"]["activities"]
+    finally:
+        remove_provider(provider["id"])
+        if original_provider_id:
+            client.post(f"/api/model-providers/{original_provider_id}/activate")
+        remove_workspace_by_path(repo)
+
+
+def test_automatic_continuation_runs_only_the_next_planned_stage(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "automatic-continuation-repo"
+    init_clean_repo(repo)
+    original_provider_id = active_provider_id()
+    provider = client.post("/api/model-providers", json={
+        "name": f"continuation-{uuid.uuid4().hex}", "kind": "external", "base_url": "https://example.test/v1", "model_name": "test-model",
+    }).json()
+    client.post(f"/api/model-providers/{provider['id']}/activate")
+
+    class RoutingResponse:
+        def raise_for_status(self) -> None: pass
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": json.dumps({
+                "task_type": "development", "complexity_reason": "multi-stage", "workflow": "full",
+                "required_stages": [main.REQUIREMENTS_STAGE, main.HIGH_LEVEL_DESIGN_STAGE],
+            })}}]}
+
+    class StreamResponse:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def raise_for_status(self) -> None: pass
+        def iter_lines(self):
+            return iter(['data: {"choices":[{"delta":{"content":"stage complete"},"finish_reason":"stop"}]}', "data: [DONE]"])
+
+    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: RoutingResponse())
+    monkeypatch.setattr(main.httpx, "stream", lambda *args, **kwargs: StreamResponse())
+    task = client.post("/api/tasks", json={"source_type": "local", "local_path": str(repo), "title": f"continuation-{uuid.uuid4().hex}"}).json()
+    try:
+        assert client.patch(f"/api/tasks/{task['id']}/execution-mode", json={"execution_mode": "automatic"}).status_code == 200
+        assert client.post(f"/api/tasks/{task['id']}/messages/stream", json={"content": "implement this"}).status_code == 200
+        current = client.get(f"/api/tasks/{task['id']}").json()
+        assert current["current_stage"] == main.AWAIT_ACCEPTANCE_STAGE
+        history = client.get(f"/api/tasks/{task['id']}/messages").json()
+        assert [message["role"] for message in history] == ["user", "assistant"]
+        stages = client.get(f"/api/tasks/{task['id']}/stages").json()
+        assert [stage["stage"] for stage in stages] == [main.REQUIREMENTS_STAGE, main.HIGH_LEVEL_DESIGN_STAGE]
+        agent_run = client.get(f"/api/tasks/{task['id']}/agent-runs").json()[0]
+        assert [stage["stage"] for stage in agent_run["result"]["stages"]] == [main.REQUIREMENTS_STAGE, main.HIGH_LEVEL_DESIGN_STAGE]
     finally:
         remove_provider(provider["id"])
         if original_provider_id:

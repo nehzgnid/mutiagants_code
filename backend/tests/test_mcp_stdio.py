@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from backend.app import main
-from backend.app.main import SessionLocal, app
+from backend.app.main import McpServer, SessionLocal, TaskMcpTool, app
 from backend.tests.test_task_sources import init_clean_repo, remove_workspace_by_path
 
 
@@ -67,35 +67,29 @@ def test_stdio_mcp_rejects_unavailable_command() -> None:
     assert "MCP Server" in response.text
 
 
-def test_builtin_coding_mcp_is_global_and_scoped_to_task_workspace(tmp_path: Path) -> None:
-    response = client.post("/api/mcp-servers/presets/coding")
-    assert response.status_code == 201, response.text
-    preset = response.json()
-    server = preset["server"]
-    assert {tool["name"] for tool in server["tools"]} == {
-        "list_workspace_files", "read_workspace_file", "write_workspace_file",
-    }
-    assert next(tool for tool in server["tools"] if tool["name"] == "write_workspace_file")["access_mode"] == "workspace-write"
+def test_builtin_coding_mcp_preset_is_removed() -> None:
+    assert client.post("/api/mcp-servers/presets/coding").status_code in {404, 405}
 
-    repo = tmp_path / "coding-mcp-workspace"
-    init_clean_repo(repo)
-    task = client.post("/api/tasks", json={
-        "source_type": "local", "local_path": str(repo), "title": f"coding-mcp-{uuid.uuid4().hex}",
-    }).json()
-    try:
-        with SessionLocal() as db:
-            record = db.get(main.Task, task["id"])
-            tools = [tool["function"] for tool in main.tools_for_task(record, db)]
-            assert any(function["name"].endswith("read_workspace_file") for function in tools)
-            assert not any(function["name"].endswith("write_workspace_file") for function in tools)
-            record.permission_mode = "workspace-write"
-            record.current_stage = main.IMPLEMENTATION_STAGE
-            write_function = next(function for function in main.tools_for_task(record, db)
-                                  if function["function"]["name"].endswith("write_workspace_file"))["function"]
-            result = main.execute_tool(record, write_function["name"], {"path": "created.txt", "content": "workspace only"}, db)
-            assert "created.txt" in result
-        assert (repo / "created.txt").read_text(encoding="utf-8") == "workspace only"
-    finally:
-        remove_workspace_by_path(repo)
-        if preset["created"]:
-            client.delete(f"/api/mcp-servers/{server['id']}")
+
+def test_legacy_builtin_coding_mcp_is_removed_when_script_is_an_argument() -> None:
+    server_id = str(uuid.uuid4())
+    task_id = str(uuid.uuid4())
+    with SessionLocal() as db:
+        db.add(McpServer(
+            id=server_id, name=f"legacy-coding-{server_id}", command=sys.executable,
+            arguments=["C:/legacy/backend/app/builtin_coding_mcp.py"], enabled=True,
+            tools=[], created_at=main.now(), updated_at=main.now(),
+        ))
+        db.add(TaskMcpTool(
+            id=str(uuid.uuid4()), task_id=task_id, server_id=server_id,
+            tool_name="write_workspace_file", access_mode="workspace-write",
+        ))
+        db.commit()
+        legacy_servers = [server for server in db.scalars(main.select(McpServer)) if main.is_legacy_coding_mcp(server)]
+        for server in legacy_servers:
+            for binding in db.scalars(main.select(TaskMcpTool).where(TaskMcpTool.server_id == server.id)):
+                db.delete(binding)
+            db.delete(server)
+        db.commit()
+        assert db.get(McpServer, server_id) is None
+        assert not list(db.scalars(main.select(TaskMcpTool).where(TaskMcpTool.server_id == server_id)))

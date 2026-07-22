@@ -1722,6 +1722,87 @@ Verification: traced task deletion from its `DELETE` request to the shared respo
 
 Verification: `npm --prefix frontend run build` passed; `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_task_management.py backend\\tests\\test_frontend_mcp_configuration.py -q` passed with 4 tests.
 
+## 2026-07-22
+
+### Documentation
+
+- Completed the delivery record for durable main-Agent run recovery, including requirements analysis, design, code review, and regression coverage.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py backend\\tests\\test_frontend_message_labels.py -q` passed with 15 tests and one existing Starlette deprecation warning; `npm --prefix frontend run build`, `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py`, and `git diff --check` passed; the backend serving the current code returned HTTP 200 at `http://127.0.0.1:8789/api/tasks`.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: streamed main-Agent output and progress disappear after a model or network failure because only a successful final answer is stored in conversation history.
+- High-level design: use the existing durable `AgentRun` record as the recovery source for in-progress and failed main-Agent streams.
+- Detailed design: persist workflow, activities, incremental text, changed-file notices, and terminal errors in `AgentRun.result`; reload non-completed runs when a task is opened.
+
+Verification: traced `/messages/stream`, `/agent-runs`, the frontend stream consumer, and task-refresh state handling.
+
+### Code
+
+- Added the additive `agent_runs.result` migration and persisted user-visible main-Agent stream state before each token is sent.
+- Recorded terminal failures on the same run and expanded the run API response with the recovery payload.
+- Restored running and failed Agent runs after refresh; only successful streamed replies are removed after their persisted conversation message is available.
+
+Verification: pending automated verification.
+
+## 2026-07-22
+
+### Documentation
+
+- Recorded completed verification for durable main-Agent run recovery.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py backend\\tests\\test_frontend_message_labels.py -q` passed with 15 tests and one existing Starlette deprecation warning; `npm --prefix frontend run build`, `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py`, and `git diff --check` passed; the current backend started successfully at `http://127.0.0.1:8789/api/tasks` and returned HTTP 200.
+
+### Code Review
+
+- Confirmed the change does not alter model prompts, task routing, or successful message persistence; completed runs remain excluded from recovery to prevent duplicate answers.
+- Confirmed an exception now preserves already received content and reports the error beside it rather than replacing the run with an empty state.
+
+Verification: static review of `backend/app/main.py` and `frontend/src/main.tsx`.
+
+### Unit Testing
+
+- Added backend coverage for failed stream run recovery data and frontend contract coverage for restoring non-completed Agent runs.
+
+Verification: pending automated verification.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: replace whole-file writes and synchronous shell execution with durable, observable operations that support patch review, cancellation, undo, external-path authorization, and Git completion.
+- High-level design: centralize local coding operations in the backend executor; retain MCP only for third-party integrations and remove the bundled coding MCP preset.
+- Detailed design: persist execution operations and events, use hash-checked text edits with atomic application, stream command output through operation records, and expose approval, cancellation, undo, Git status, and confirmed commit APIs.
+
+Verification: reviewed the task workflow, MCP registration, tool dispatch, frontend composer, and existing backend contracts before implementation.
+
+### Code
+
+- Added durable execution operation/event records, manual-confirmation coding mode, hash-checked atomic patching, conflict reporting, undo, background command output, cancellation, explicit external-directory grants, and task-scoped Git status/commit APIs.
+- Added an execution panel for patch diffs, approval, cancellation, undo, command output, and confirmed Agent-change commits.
+- Removed the bundled coding MCP preset and its implementation; third-party MCP server management remains available.
+- Documentation: updated the README from legacy `write_file` and bundled-MCP instructions to patch approval, command execution, external authorization, and Git completion behavior.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 46 tests; `npm --prefix frontend run build`, `python -m py_compile backend\\app\\main.py`, and `git diff --check` passed.
+
+### Code Review
+
+- Confirmed patch application validates every edit before writing, conflicts do not overwrite changed files, undo validates post-operation hashes, and command execution no longer uses `shell=True`.
+- Confirmed Git commits stage only paths recorded by completed patch operations and require the workspace test command to pass.
+- Confirmed the removed preset has no remaining production references and MCP retains only external-server management.
+
+Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, `frontend/src/styles.css`, and associated regression tests; `git diff --check` passed.
+
+### Unit Testing
+
+- Added regression coverage for atomic patch/undo, manual-approval conflicts, streamed command output, and Git status plus commit.
+- Updated MCP and workflow contracts for the removed preset and `apply_patch` tool.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 46 tests and one pre-existing Starlette deprecation warning.
+
 ### Code Review
 
 - Confirmed the 204 branch executes only after a successful response check, so server failures still surface their response text and JSON-producing endpoints retain their existing parsing behavior.
@@ -1733,3 +1814,200 @@ Verification: reviewed `frontend/src/main.tsx`; `git diff --check` passed.
 - Added a regression contract requiring the shared frontend helper to bypass JSON parsing for HTTP 204.
 
 Verification: `npm --prefix frontend run build` passed; `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_task_management.py backend\\tests\\test_frontend_mcp_configuration.py -q` passed with 4 tests.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: a removed built-in coding MCP remained in existing local databases, causing its missing script to fail as an opaque `TaskGroup` error; Agent run cards were also rendered after all messages instead of at their creation time.
+- High-level design: remove only stale built-in-MCP records during startup and render messages plus Agent runs through one timestamp-sorted timeline.
+- Detailed design: delete legacy MCP bindings and server records by the retired script marker, downgrade any third-party MCP call exception to a tool result, and sort `TaskMessage` and `AgentRun` UI entries by `created_at`.
+
+Verification: reviewed persisted MCP configuration, the stream tool dispatch path, and conversation rendering order.
+
+### Code
+
+- Added startup cleanup for the retired `builtin_coding_mcp.py` server record and made MCP call exceptions recoverable tool failures.
+- Added a unified chronological conversation timeline that interleaves user/model messages and Agent run panels.
+
+Verification: the stale built-in MCP count in the current database is 0.
+
+### Code Review
+
+- Confirmed cleanup targets only the retired bundled script and retains third-party MCP servers; equal timestamps place the user/model message before its run card.
+
+Verification: reviewed `backend/app/main.py` and `frontend/src/main.tsx`; `git diff --check` passed.
+
+### Unit Testing
+
+- Updated conversation viewport coverage for timestamp ordering.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py backend\\tests\\test_frontend_conversation_viewport.py backend\\tests\\test_frontend_message_labels.py -q` passed with 18 tests and one existing Starlette deprecation warning; `npm --prefix frontend run build` and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: automatic mode must continue only through the route returned by the master Agent, while the collaboration chain must appear immediately after routing and visually identify the currently active Agent.
+- High-level design: reuse the stream endpoint for an explicit continuation request without creating a user message; drive the chain display from early workflow and stage events.
+- Detailed design: allow an empty `continuation` request only when the current stage remains in `routing_decision.required_stages`, then start that stage; sort visual state from workflow/stage events and apply active styling only to the live Agent.
+
+Verification: reviewed stage progression, stream request handling, and the existing collaboration-chain component.
+
+### Code
+
+- Added automatic continuation requests that start only the next master-planned stage, retain the original conversation history, and stop after the plan ends or an error occurs.
+- Emitted the active stage at stream start; displayed the master-planned collaboration chain immediately, with ordinary text for all Agents except the currently executing one.
+
+Verification: pending final server smoke check.
+
+### Code Review
+
+- Confirmed continuation checks the stored `required_stages` rather than a fixed workflow list, so omitted stages are never introduced by the executor.
+- Confirmed completed Agent chain items return to normal font weight because active styling exists only on the live run card.
+
+Verification: reviewed `backend/app/main.py`, `frontend/src/main.tsx`, and `frontend/src/styles.css`; `git diff --check` passed.
+
+### Unit Testing
+
+- Added automatic-continuation coverage for a master plan containing only requirements analysis and overview design, including the no-extra-user-message contract.
+- Added frontend coverage for current-Agent-only emphasis.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py backend\\tests\\test_workflow_orchestration.py backend\\tests\\test_frontend_message_labels.py -q` passed with 26 tests and one existing Starlette deprecation warning; `npm --prefix frontend run build` and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` passed.
+
+## 2026-07-22
+
+### Documentation
+
+- Recorded that automatic continuation also resumes an already-planned automatic task when it is reopened, using the same master-Agent stage contract.
+
+Verification: the targeted 26-test suite, frontend build, Python compilation, and `git diff --check` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: a complete automatic workflow must be one conversation and one durable work record, with every planned stage retained in its expandable work panel rather than emitted as independent chats.
+- High-level design: move automatic stage continuation into the backend's single SSE generator and persist stage outputs as an ordered list on its one `AgentRun`.
+- Detailed design: loop through only the master-planned next stages, rebuild the model request with prior stage output, add one final assistant message after the workflow ends, and render persisted stage output inside the single run card.
+
+Verification: reviewed stream lifecycle, task-stage transitions, AgentRun serialization, and conversation rendering.
+
+### Code
+
+- Replaced client-driven automatic continuation with an in-stream backend stage loop that keeps one `AgentRun` and one final Agent reply for the entire master-planned workflow.
+- Added persisted stage status/output records and a complete, expandable work-panel timeline; workflow stages now remain visible after refresh.
+- Kept model private reasoning hidden while exposing user-facing stage outputs and operational activity summaries.
+
+Verification: pending server smoke check.
+
+### Code Review
+
+- Confirmed the loop calls `can_continue_automatically`, which derives continuation strictly from the master Agent's stored `required_stages`.
+- Confirmed intermediate stage output is not written as individual assistant messages; final output is written once after the plan ends.
+
+Verification: reviewed `backend/app/main.py`, `frontend/src/main.tsx`, and `frontend/src/styles.css`; `git diff --check` passed.
+
+### Unit Testing
+
+- Updated automatic-workflow coverage to assert one final assistant message and two persisted stage outputs from one stream request.
+- Updated completed-run recovery coverage for the persisted work panel.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py backend\\tests\\test_workflow_orchestration.py backend\\tests\\test_frontend_message_labels.py backend\\tests\\test_frontend_conversation_viewport.py -q` passed with 29 tests and one existing Starlette deprecation warning; `npm --prefix frontend run build` and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: move execution records out of the chat stream into a left-side workspace that can host additional task tooling and can be hidden or restored from a compact upper-corner icon.
+- High-level design: retain the task list, add a second collapsible workspace column, and keep the conversation as the primary right-hand surface.
+- Detailed design: render execution records and environment facts as independent workspace sections; switch the grid between two and three columns, with a responsive vertical layout on narrow screens.
+
+Verification: reviewed existing task/sidebar layout, execution-panel interactions, and desktop/mobile reference images.
+
+### Code
+
+- Moved the execution panel into a toggleable left-side workspace, added an environment-information extension section, and added an icon-only show/hide control in the task title bar.
+- Added responsive workspace sizing for desktop, tablet, and mobile layouts.
+
+Verification: `npm --prefix frontend run build` passed; browser inspection verified the open, hidden, and 390px-wide states.
+
+### Code Review
+
+- Confirmed execution approval, cancellation, undo, and commit callbacks are unchanged; the change is limited to their visual container and surrounding layout.
+- Confirmed hiding the workspace removes its grid column and the upper-corner button restores it with an accessible label and tooltip.
+
+Verification: reviewed `frontend/src/main.tsx` and `frontend/src/styles.css`; `git diff --check` passed.
+
+### Unit Testing
+
+- Added a frontend contract for the toggleable workspace panel and retained existing chat and conversation-viewport tests.
+
+Verification: pending final test run.
+
+## 2026-07-22
+
+### Documentation
+
+- Recorded completed verification for the toggleable left workspace panel.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_workspace_panel.py backend\\tests\\test_frontend_message_labels.py backend\\tests\\test_frontend_conversation_viewport.py backend\\tests\\test_frontend_task_management.py -q` passed with 17 tests; `npm --prefix frontend run build` and `git diff --check` passed. Browser inspection confirmed desktop open/hide/restore and 390px-wide responsive layouts at `http://127.0.0.1:8793`.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: place the toggleable workspace on the right side of the primary conversation surface.
+- High-level design: retain the task list on the left and reorder the central grid to task list, conversation, workspace.
+- Detailed design: move the workspace DOM after the workbench and swap the desktop/tablet grid tracks so the flexible track remains the conversation.
+
+Verification: reviewed the workspace grid and DOM order.
+
+### Code
+
+- Moved the toggleable workspace to the right of the conversation panel.
+
+Verification: `npm --prefix frontend run build` passed.
+
+### Code Review
+
+- Confirmed the change only reorders layout regions and preserves existing workspace controls, hide/restore behavior, and mobile vertical layout.
+
+Verification: `git diff --check` passed.
+
+### Unit Testing
+
+- Re-ran workspace-panel and conversation-viewport contracts.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_workspace_panel.py backend\\tests\\test_frontend_conversation_viewport.py -q` passed with 4 tests.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: an automatic workflow must execute the full master-planned stage list within one conversation; a stale removed coding MCP was still offered to models because its script path is stored in server arguments, causing implementation writes to fail mid-run.
+- High-level design: clean up legacy built-in coding MCP records before task tools are exposed, while preserving third-party MCP servers.
+- Detailed design: identify the obsolete server by scanning both its executable command and argument vector for `builtin_coding_mcp.py`, then delete its task bindings and server record atomically during startup migration.
+
+Verification: inspected the persisted MCP record and the one-request automatic SSE stage loop.
+
+### Code
+
+- Fixed startup migration to remove stale built-in coding MCP records whose removed script is supplied as a command argument, preventing `write_workspace_file` from being offered after the host `apply_patch` executor succeeds.
+- Added regression coverage for the argument-path legacy record and its task-tool bindings.
+- Removed the obsolete client-side automatic-continuation request; the backend now remains the sole owner of all planned-stage continuation within one SSE stream and one work record.
+
+Verification: `npm --prefix frontend run build` and `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_mcp_stdio.py backend\\tests\\test_task_conversation.py backend\\tests\\test_frontend_conversation_viewport.py -q` passed with 14 tests.
+
+### Code Review
+
+- Confirmed the matcher is exact to the obsolete script basename and does not remove unrelated third-party MCP servers.
+- Confirmed the automatic workflow remains driven only by the master Agent's stored `required_stages` and retains a single SSE/conversation lifecycle.
+
+Verification: reviewed `backend/app/main.py` cleanup and tool exposure flow.
+
+### Unit Testing
+
+- Ran focused MCP cleanup, automatic workflow, and frontend single-stream contract tests.
+
+Verification: `npm --prefix frontend run build` and `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_mcp_stdio.py backend\\tests\\test_task_conversation.py backend\\tests\\test_frontend_conversation_viewport.py -q` passed with 14 tests; `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` and `git diff --check` passed.

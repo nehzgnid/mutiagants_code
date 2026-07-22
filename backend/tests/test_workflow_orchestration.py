@@ -100,7 +100,7 @@ def test_master_agent_uses_full_route_and_requires_confirmation_before_coding(tm
             assert implementation.stage == "编码实现"
             assert implementation.agent == "执行 Agent"
             assert main.write_enabled(record)
-            assert {tool["function"]["name"] for tool in main.tools_for_task(record)} == {"list_files", "read_file", "write_file"}
+            assert {tool["function"]["name"] for tool in main.tools_for_task(record)} == {"list_files", "read_file", "apply_patch"}
             db.commit()
     finally:
         remove_workspace_by_path(repo)

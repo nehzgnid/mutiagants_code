@@ -27,7 +27,7 @@ import remarkGfm from "remark-gfm";
 import "./styles.css";
 
 type PermissionMode = "read-only" | "workspace-write" | "full-access";
-type ExecutionMode = "confirm_before_coding" | "automatic";
+type ExecutionMode = "confirm_before_coding" | "automatic" | "manual_confirmation";
 type McpAccessMode = "read-only" | "workspace-write" | "full-access";
 type McpTool = { name: string; description: string; input_schema: Record<string, unknown>; access_mode?: McpAccessMode };
 type McpServer = { id: string; name: string; command: string; arguments: string[]; enabled: boolean; tools: McpTool[] };
@@ -67,17 +67,37 @@ type Provider = {
 type SourceMode = "local" | "github";
 type ActivityItem = { kind: string; title: string; detail: string };
 type ChangedFile = { path: string; action: string };
+type RunStage = { stage: string; agent: string; status: string; output?: string };
 type Run = {
   id: string;
+  created_at: string;
   title?: string;
   content: string;
   activities: ActivityItem[];
   files: ChangedFile[];
   complete: boolean;
   workflow?: RoutingDecision;
+  activeAgent?: string;
+  stages: RunStage[];
   error?: string;
   retryContent?: string;
 };
+type AgentRun = {
+  id: string;
+  status: string;
+  created_at: string;
+  result: {
+    content?: string;
+    activities?: ActivityItem[];
+    files?: ChangedFile[];
+    stages?: RunStage[];
+    error?: string;
+    workflow?: RoutingDecision;
+  };
+};
+type ConversationItem =
+  | { kind: "message"; created_at: string; message: TaskMessage }
+  | { kind: "run"; created_at: string; run: Run };
 type StageRun = {
   id: string;
   stage: string;
@@ -92,7 +112,34 @@ type ContextUsage = {
   compacted_messages: number;
   compressible_messages: number;
 };
+type ExecutionOperation = {
+  id: string;
+  kind: "patch" | "command";
+  status: string;
+  request: Record<string, unknown>;
+  result: Record<string, unknown> | null;
+  created_at: string;
+};
 const INITIAL_RENDERED_MESSAGES = 20;
+
+function restoreAgentRuns(agentRuns: AgentRun[]): Run[] {
+  return agentRuns
+    .filter((run) => run.status !== "completed" || (run.result.stages?.length ?? 0) > 0)
+    .reverse()
+    .map((run) => ({
+      id: run.id,
+      created_at: run.created_at,
+      title: run.status === "failed" ? "Agent 运行失败" : "Agent 正在工作",
+      content: run.result.content ?? "",
+      activities: run.result.activities ?? [],
+      files: run.result.files ?? [],
+      complete: run.status !== "running",
+      workflow: run.result.workflow,
+      activeAgent: [...(run.result.activities ?? [])].reverse().find((activity) => activity.kind === "agent")?.title,
+      stages: run.result.stages ?? [],
+      error: run.result.error,
+    }));
+}
 const api = async <T,>(url: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -111,6 +158,7 @@ const permissionLabels: Record<PermissionMode, string> = {
 const executionModeLabels: Record<ExecutionMode, string> = {
   confirm_before_coding: "计划模式",
   automatic: "自动编码",
+  manual_confirmation: "手动确认编码",
 };
 const mcpAccessLabels: Record<McpAccessMode, string> = {
   "read-only": "只读",
@@ -127,6 +175,7 @@ function App() {
     [stageRuns, setStageRuns] = useState<StageRun[]>([]),
     [contextUsage, setContextUsage] = useState<ContextUsage | null>(null),
     [runs, setRuns] = useState<Run[]>([]),
+    [operations, setOperations] = useState<ExecutionOperation[]>([]),
     [draft, setDraft] = useState(""),
     [sending, setSending] = useState(false),
     [compressing, setCompressing] = useState(false),
@@ -139,6 +188,7 @@ function App() {
     [showModels, setShowModels] = useState(false),
     [showPermissions, setShowPermissions] = useState(false),
     [showExecutionModes, setShowExecutionModes] = useState(false),
+    [showWorkPanel, setShowWorkPanel] = useState(true),
     [renderedMessageCount, setRenderedMessageCount] = useState(INITIAL_RENDERED_MESSAGES),
     [scrollToLatestRequest, setScrollToLatestRequest] = useState(0);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -163,11 +213,13 @@ function App() {
     void load();
   }, []);
   const refreshTaskWorkflow = async (taskId: string) => {
-    const [task, taskMessages, stages, context] = await Promise.all([
+    const [task, taskMessages, stages, context, taskOperations, agentRuns] = await Promise.all([
       api<Task>(`/api/tasks/${taskId}`),
       api<TaskMessage[]>(`/api/tasks/${taskId}/messages`),
       api<StageRun[]>(`/api/tasks/${taskId}/stages`),
       api<ContextUsage>(`/api/tasks/${taskId}/context`),
+      api<ExecutionOperation[]>(`/api/tasks/${taskId}/operations`),
+      api<AgentRun[]>(`/api/tasks/${taskId}/agent-runs`),
     ]);
     setSelected(task);
     setTasks((items) =>
@@ -176,6 +228,9 @@ function App() {
     setMessages(taskMessages);
     setStageRuns(stages);
     setContextUsage(context);
+    setOperations(taskOperations);
+    setRuns(restoreAgentRuns(agentRuns));
+    return task;
   };
   useEffect(() => {
     if (!selected) {
@@ -183,20 +238,31 @@ function App() {
       setStageRuns([]);
       setRuns([]);
       setContextUsage(null);
+      setOperations([]);
       return;
     }
     setRuns([]);
     Promise.all([
       api<TaskMessage[]>(`/api/tasks/${selected.id}/messages`),
       api<StageRun[]>(`/api/tasks/${selected.id}/stages`),
-      api<ContextUsage>(`/api/tasks/${selected.id}/context`),
+      api<ContextUsage>(`/api/tasks/${selected.id}/context`), api<ExecutionOperation[]>(`/api/tasks/${selected.id}/operations`),
+      api<AgentRun[]>(`/api/tasks/${selected.id}/agent-runs`),
     ])
-      .then(([items, stages, context]) => {
+      .then(([items, stages, context, taskOperations, agentRuns]) => {
         setMessages(items);
         setStageRuns(stages);
         setContextUsage(context);
+        setOperations(taskOperations);
+        setRuns(restoreAgentRuns(agentRuns));
       })
       .catch((error) => setNotice(String(error).replace(/^Error: /, "")));
+  }, [selected?.id]);
+  useEffect(() => {
+    if (!selected) return;
+    const timer = window.setInterval(() => {
+      api<ExecutionOperation[]>(`/api/tasks/${selected.id}/operations`).then(setOperations).catch(() => undefined);
+    }, 1000);
+    return () => window.clearInterval(timer);
   }, [selected?.id]);
   useLayoutEffect(() => {
     if (scrollToLatestRequest === 0) return;
@@ -209,8 +275,15 @@ function App() {
     setScrollToLatestRequest((request) => request + 1);
     setSelected(task);
   };
-  const renderedMessages = messages.slice(-renderedMessageCount);
-  const hiddenMessageCount = messages.length - renderedMessages.length;
+  const timelineItems: ConversationItem[] = [
+    ...messages.map((message) => ({ kind: "message" as const, created_at: message.created_at, message })),
+    ...runs.map((run) => ({ kind: "run" as const, created_at: run.created_at, run })),
+  ].sort((left, right) => {
+    const timeDifference = Date.parse(left.created_at) - Date.parse(right.created_at);
+    return timeDifference || (left.kind === "message" ? -1 : 1);
+  });
+  const renderedTimelineItems = timelineItems.slice(-renderedMessageCount);
+  const hiddenMessageCount = timelineItems.length - renderedTimelineItems.length;
   const selectProvider = async (provider: Provider) => {
     try {
       await api<Provider>(`/api/model-providers/${provider.id}/activate`, {
@@ -274,6 +347,24 @@ function App() {
     setRuns((items) =>
       items.map((item) => (item.id === id ? update(item) : item)),
     );
+  const updateOperation = async (operation: ExecutionOperation, action: "approval" | "cancel" | "undo", approve?: boolean) => {
+    if (!selected) return;
+    try {
+      await api<ExecutionOperation>(`/api/tasks/${selected.id}/operations/${operation.id}/${action}`, {
+        method: "POST", body: action === "approval" ? JSON.stringify({ approve }) : undefined,
+      });
+      await refreshTaskWorkflow(selected.id);
+    } catch (error) { setNotice(String(error).replace(/^Error: /, "")); }
+  };
+  const commitAgentChanges = async () => {
+    if (!selected) return;
+    const message = window.prompt("提交说明");
+    if (!message?.trim()) return;
+    try {
+      await api(`/api/tasks/${selected.id}/git/commit`, { method: "POST", body: JSON.stringify({ message }) });
+      await refreshTaskWorkflow(selected.id);
+    } catch (error) { setNotice(String(error).replace(/^Error: /, "")); }
+  };
   const compressContext = async () => {
     if (!selected || sending || compressing) return;
     const taskId = selected.id;
@@ -282,11 +373,13 @@ function App() {
       ...items,
       {
         id: runId,
+        created_at: new Date().toISOString(),
         title: "正在压缩上下文",
         content: "",
         activities: [
           { kind: "agent", title: "上下文压缩", detail: "正在准备压缩" },
         ],
+        stages: [],
         files: [],
         complete: false,
       },
@@ -370,19 +463,17 @@ function App() {
       runId = `run-${Date.now()}`;
     setMessages((items) => [
       ...items,
-      {
-        id: `pending-${Date.now()}`,
-        role: "user",
-        content,
-        created_at: new Date().toISOString(),
-      },
+      { id: `pending-${Date.now()}`, role: "user", content, created_at: new Date().toISOString() },
     ]);
     setRuns((items) => [
       ...items,
       {
         id: runId,
+        created_at: new Date().toISOString(),
         content: "",
-        activities: [{ kind: "agent", title: "主 Agent 路由", detail: "正在判定任务复杂度和协作流程" }],
+        activities: [{ kind: "agent", title: "主 Agent", detail: "正在判定任务复杂度和协作流程" }],
+        activeAgent: "主 Agent",
+        stages: [],
         files: [],
         complete: false,
       },
@@ -393,7 +484,7 @@ function App() {
       const response = await fetch(`/api/tasks/${taskId}/messages/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({ content, continuation: false }),
       });
       if (!response.ok || !response.body)
         throw new Error((await response.text()) || response.statusText);
@@ -411,10 +502,23 @@ function App() {
           const data = chunk.match(/^data: (.+)$/m)?.[1];
           if (!eventName || !data) continue;
           const payload = JSON.parse(data);
+          if (eventName === "workflow")
+            updateRun(runId, (run) => ({ ...run, workflow: payload }));
+          if (eventName === "stage")
+            updateRun(runId, (run) => ({
+              ...run,
+              activeAgent: payload.status === "running" ? payload.agent : undefined,
+              stages: payload.status === "running"
+                ? [...run.stages, { stage: payload.stage, agent: payload.agent, status: "running" }]
+                : run.stages.map((stage) => stage.stage === payload.stage && stage.status === "running"
+                  ? { ...stage, status: "completed", output: payload.output }
+                  : stage),
+            }));
           if (eventName === "activity")
             updateRun(runId, (run) => ({
               ...run,
               activities: [...run.activities, payload],
+              activeAgent: payload.kind === "agent" ? payload.title : run.activeAgent,
             }));
           if (eventName === "token")
             updateRun(runId, (run) => ({
@@ -426,12 +530,13 @@ function App() {
               ...run,
               files: [...run.files, payload],
             }));
-          if (eventName === "done")
+          if (eventName === "done") {
             updateRun(runId, (run) => ({
               ...run,
               content: payload.message.content,
               complete: true,
             }));
+          }
           if (eventName === "error")
             updateRun(runId, (run) => ({
               ...run,
@@ -443,8 +548,6 @@ function App() {
         }
       }
       await refreshTaskWorkflow(taskId);
-      // The persisted assistant reply now represents this run in chronological history.
-      setRuns((items) => items.filter((run) => run.id !== runId));
     } catch (error) {
       updateRun(runId, (run) => ({
         ...run,
@@ -498,7 +601,7 @@ function App() {
           </button>
         </div>
       )}
-      <section className="layout">
+      <section className={`layout ${showWorkPanel && selected ? "work-panel-open" : "work-panel-hidden"}`}>
         <aside className="sidebar">
           <div className="section-title">
             <span>任务</span>
@@ -542,6 +645,9 @@ function App() {
             <div className="chat-shell">
               <div className="chat-title">
                 <h1>{selected.title}</h1>
+                <button className="work-panel-toggle" type="button" title={showWorkPanel ? "隐藏工作区" : "显示工作区"} aria-label={showWorkPanel ? "隐藏工作区" : "显示工作区"} onClick={() => setShowWorkPanel((visible) => !visible)}>
+                  <Settings2 size={16} />
+                </button>
               </div>
               <div className="message-list" ref={messageListRef}>
                 {messages.length === 0 && (
@@ -560,15 +666,17 @@ function App() {
                     加载更早消息（{hiddenMessageCount}）
                   </button>
                 )}
-                {renderedMessages.map((message) => {
+                {renderedTimelineItems.map((item) => {
+                  if (item.kind === "run") {
+                    return <RunOutput key={item.run.id} run={item.run} taskId={selected.id}
+                      onRetry={(content) => void sendMessage(undefined, content)} />;
+                  }
+                  const { message } = item;
                   const stageRun = message.role === "assistant"
                     ? stageRuns.find((run) => run.output === message.content)
                     : undefined;
                   return (
-                    <article
-                      className={`message ${message.role}`}
-                      key={message.id}
-                    >
+                    <article className={`message ${message.role}`} key={message.id}>
                       {message.role === "assistant" && <div className="message-role">Agent</div>}
                       {stageRun && <StageRunTrace run={stageRun} task={selected} />}
                       {message.role === "assistant" ? (
@@ -579,14 +687,6 @@ function App() {
                     </article>
                   );
                 })}
-                {runs.map((run) => (
-                  <RunOutput
-                    key={run.id}
-                    run={run}
-                    taskId={selected.id}
-                    onRetry={(content) => void sendMessage(undefined, content)}
-                  />
-                ))}
               </div>
               <form className="message-composer" onSubmit={sendMessage}>
                 <textarea
@@ -616,7 +716,7 @@ function App() {
                           <button type="button" key={mode} className={selected.execution_mode === mode ? "selected" : ""} onClick={() => void selectExecutionMode(mode)}>
                             <span>
                               <strong>{executionModeLabels[mode]}</strong>
-                              <small>{mode === "confirm_before_coding" ? "完成分析与设计后，编码前等待确认" : "完成设计后连续进入编码、审核和测试"}</small>
+                              <small>{mode === "confirm_before_coding" ? "完成分析与设计后，编码前等待确认" : mode === "manual_confirmation" ? "每组代码补丁显示 diff，确认后应用" : "完成设计后连续进入编码、审核和测试"}</small>
                             </span>
                             {selected.execution_mode === mode && <Check size={15} />}
                           </button>
@@ -764,6 +864,20 @@ function App() {
             </div>
           )}
         </section>
+        {selected && showWorkPanel && (
+          <aside className="work-panel" aria-label="工作区">
+            <div className="work-panel-title"><span>工作区</span></div>
+            <ExecutionPanel operations={operations} onAction={updateOperation} onCommit={() => void commitAgentChanges()} />
+            <section className="workspace-section" aria-label="环境信息">
+              <div className="workspace-section-title"><span>环境信息</span><Plus size={16} /></div>
+              <dl className="environment-facts">
+                <div><dt>权限</dt><dd>{permissionLabels[selected.permission_mode]}</dd></div>
+                <div><dt>模式</dt><dd>{executionModeLabels[selected.execution_mode]}</dd></div>
+                <div><dt>阶段</dt><dd>{selected.current_stage}</dd></div>
+              </dl>
+            </section>
+          </aside>
+        )}
       </section>
       {showTask && (
         <TaskModal
@@ -846,20 +960,50 @@ const stageAgents: Record<string, string> = {
   "单元测试": "测试 Agent",
 };
 
-function AgentFlow({ decision }: { decision: RoutingDecision }) {
+function AgentFlow({ decision, activeAgent }: { decision: RoutingDecision; activeAgent?: string }) {
   const agentFlow = Array.from(new Set(["主 Agent", ...decision.required_stages.map((stage) => stageAgents[stage] ?? "Agent")]));
   return (
     <div className="workflow-plan">
       <p className="workflow-plan-title">协作流程</p>
       <div className="workflow-agent-flow">
         {agentFlow.map((agent, index) => (
-          <span className="workflow-agent" key={agent}>
+          <span className={`workflow-agent ${agent === activeAgent ? "active" : ""}`} key={agent}>
             {index > 0 && <span className="workflow-arrow">→</span>}
             {agent}
           </span>
         ))}
       </div>
     </div>
+  );
+}
+
+function ExecutionPanel({ operations, onAction, onCommit }: {
+  operations: ExecutionOperation[];
+  onAction: (operation: ExecutionOperation, action: "approval" | "cancel" | "undo", approve?: boolean) => Promise<void>;
+  onCommit: () => void;
+}) {
+  const active = operations.filter((operation) => operation.status !== "completed" && operation.status !== "undone");
+  const completedPatches = operations.filter((operation) => operation.kind === "patch" && operation.status === "completed");
+  if (!operations.length) return null;
+  return (
+    <section className="execution-panel" aria-label="执行记录">
+      <div className="execution-panel-heading"><strong>执行记录</strong>{completedPatches.length > 0 && <button type="button" onClick={onCommit}><GitBranch size={14} /> 提交 Agent 变更</button>}</div>
+      {operations.slice(0, 8).map((operation) => {
+        const result = operation.result ?? {};
+        const files = Array.isArray(result.files) ? result.files as { path: string; diff: string }[] : [];
+        return <article className={`execution-operation ${operation.status}`} key={operation.id}>
+          <div className="execution-operation-title"><TerminalSquare size={14} /><strong>{operation.kind === "patch" ? "代码补丁" : "命令"}</strong><span>{operation.status}</span></div>
+          {files.map((file) => <details key={file.path}><summary>{file.path}</summary><pre>{file.diff}</pre></details>)}
+          {typeof result.stdout === "string" && <pre className="terminal-output">{result.stdout}{typeof result.stderr === "string" ? result.stderr : ""}</pre>}
+          <div className="execution-operation-actions">
+            {operation.status === "pending_approval" && <><button type="button" className="primary" onClick={() => void onAction(operation, "approval", true)}>应用补丁</button><button type="button" onClick={() => void onAction(operation, "approval", false)}>拒绝</button></>}
+            {["queued", "running", "pending_approval"].includes(operation.status) && <button type="button" onClick={() => void onAction(operation, "cancel")}>取消</button>}
+            {operation.kind === "patch" && operation.status === "completed" && <button type="button" onClick={() => void onAction(operation, "undo")}><RotateCcw size={14} /> 撤销</button>}
+          </div>
+        </article>;
+      })}
+      {active.length > 0 && <small className="execution-active">{active.length} 个操作仍在进行或等待处理</small>}
+    </section>
   );
 }
 
@@ -901,7 +1045,7 @@ function RunOutput({ run, taskId, onRetry }: { run: Run; taskId: string; onRetry
           <Activity size={15} /> {run.complete ? (run.title ?? "工作过程") : (run.title ?? "Agent 正在工作")}
         </summary>
         <div>
-          {run.workflow && <AgentFlow decision={run.workflow} />}
+          {run.workflow && <AgentFlow decision={run.workflow} activeAgent={run.activeAgent} />}
           {run.activities.map((item, index) => (
             <p
               className={`activity ${item.kind}`}
@@ -913,6 +1057,12 @@ function RunOutput({ run, taskId, onRetry }: { run: Run; taskId: string; onRetry
                 {item.detail}
               </span>
             </p>
+          ))}
+          {run.stages.map((stage) => (
+            <section className="run-stage" key={`${stage.stage}-${stage.agent}`}>
+              <p><span className={stage.status === "running" ? "active-stage" : ""}>{stage.agent} · {stage.stage}</span></p>
+              {stage.output && <MarkdownContent content={stage.output} taskId={taskId} />}
+            </section>
           ))}
         </div>
       </details>
@@ -926,7 +1076,7 @@ function RunOutput({ run, taskId, onRetry }: { run: Run; taskId: string; onRetry
           )}
         </>
       ) : (
-        run.content && <MarkdownContent content={run.content} taskId={taskId} />
+        run.content && run.stages.length === 0 && <MarkdownContent content={run.content} taskId={taskId} />
       )}
       {run.files.length > 0 && (
         <div className="changed-files">
@@ -1219,13 +1369,6 @@ function McpServerModal({
       onChanged();
     } catch (error) { setMessage(String(error).replace(/^Error: /, "")); }
   };
-  const addCodingPreset = async () => {
-    try {
-      const result = await api<{ created: boolean; server: McpServer }>("/api/mcp-servers/presets/coding", { method: "POST" });
-      setMessage(result.created ? `已添加 ${result.server.name}，所有任务现在都可自动使用其工具。` : `${result.server.name} 已存在，所有任务均可使用。`);
-      onChanged();
-    } catch (error) { setMessage(String(error).replace(/^Error: /, "")); }
-  };
   const remove = async (server: McpServer) => {
     if (!window.confirm(`删除 MCP Server“${server.name}”？所有任务将不再使用它。`)) return;
     try { await api<void>(`/api/mcp-servers/${server.id}`, { method: "DELETE" }); onChanged(); if (editing?.id === server.id) reset(); }
@@ -1246,10 +1389,9 @@ function McpServerModal({
           )) : <p>尚未配置 MCP Server。</p>}
         </div>
         <section className="mcp-create-section" aria-labelledby="create-mcp-server">
-          <h3 id="create-mcp-server" className="mcp-section-heading">创建编码服务器</h3>
+          <h3 id="create-mcp-server" className="mcp-section-heading">创建外部 MCP 服务</h3>
           <div className="mcp-create-actions">
-            <button type="button" className="primary" onClick={() => void addCodingPreset()}><Plus size={16} /> 添加预制服务器</button>
-            <button type="button" onClick={() => { reset(); setShowCustomForm(true); }}>自主配置服务器</button>
+            <button type="button" className="primary" onClick={() => { reset(); setShowCustomForm(true); }}><Plus size={16} /> 配置 MCP 服务</button>
           </div>
         </section>
         {showCustomForm && <form onSubmit={submit} className="provider-form mcp-custom-form">
