@@ -14,3 +14,9 @@ def test_task_sidebar_exposes_hover_configuration_and_delete_actions() -> None:
     assert "初始需求" not in source
     assert ".task-row:hover" in styles
     assert ".task-row:hover .task-menu-button" in styles
+
+
+def test_frontend_accepts_empty_successful_delete_responses() -> None:
+    source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+
+    assert "if (response.status === 204) return undefined as T;" in source

@@ -1705,3 +1705,31 @@ Verification: reviewed `frontend/src/main.tsx` and `frontend/src/styles.css`; `g
 - Updated the frontend MCP contract to require the existing-server list, both server-creation paths, and each retained row action.
 
 Verification: `npm --prefix frontend run build` passed; `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_mcp_configuration.py -q` passed with 2 tests.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: deleting a task succeeds on the backend but presents an error in the frontend after the successful response.
+- High-level design: preserve the existing `204 No Content` deletion contract and make the shared frontend response helper accept empty successful responses.
+- Detailed design: return `undefined` for HTTP 204 before attempting JSON parsing; add a frontend contract test for that branch.
+
+Verification: traced task deletion from its `DELETE` request to the shared response helper and confirmed the backend returns HTTP 204.
+
+### Code
+
+- Made the shared frontend API helper handle successful 204 responses without parsing a JSON body, preventing the false error after task deletion.
+
+Verification: `npm --prefix frontend run build` passed; `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_task_management.py backend\\tests\\test_frontend_mcp_configuration.py -q` passed with 4 tests.
+
+### Code Review
+
+- Confirmed the 204 branch executes only after a successful response check, so server failures still surface their response text and JSON-producing endpoints retain their existing parsing behavior.
+
+Verification: reviewed `frontend/src/main.tsx`; `git diff --check` passed.
+
+### Unit Testing
+
+- Added a regression contract requiring the shared frontend helper to bypass JSON parsing for HTTP 204.
+
+Verification: `npm --prefix frontend run build` passed; `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_task_management.py backend\\tests\\test_frontend_mcp_configuration.py -q` passed with 4 tests.

@@ -100,6 +100,7 @@ const api = async <T,>(url: string, init?: RequestInit): Promise<T> => {
   });
   if (!response.ok)
     throw new Error((await response.text()) || response.statusText);
+  if (response.status === 204) return undefined as T;
   return response.json();
 };
 const permissionLabels: Record<PermissionMode, string> = {
