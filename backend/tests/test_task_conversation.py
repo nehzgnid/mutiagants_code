@@ -78,7 +78,7 @@ def test_task_conversation_persists_history_and_sends_context(monkeypatch, tmp_p
 def test_workspace_write_tools_cannot_escape_the_task_directory(tmp_path: Path) -> None:
     repo = tmp_path / "tool-repo"
     repo.mkdir()
-    task = Task(worktree_path=str(repo), permission_mode="workspace-write")
+    task = Task(worktree_path=str(repo), permission_mode="workspace-write", current_stage=main.IMPLEMENTATION_STAGE)
     main.write_local_file(task, {"path": "notes.txt", "content": "allowed"})
     assert (repo / "notes.txt").read_text(encoding="utf-8") == "allowed"
     try:
@@ -86,6 +86,19 @@ def test_workspace_write_tools_cannot_escape_the_task_directory(tmp_path: Path) 
         assert False, "writing outside the task directory should fail"
     except ValueError as error:
         assert "only allows paths inside" in str(error)
+
+
+def test_local_write_tool_rejects_non_writable_workflow_stages(tmp_path: Path) -> None:
+    repo = tmp_path / "acceptance-repo"
+    repo.mkdir()
+    task = Task(worktree_path=str(repo), permission_mode="workspace-write", current_stage=main.AWAIT_ACCEPTANCE_STAGE)
+
+    try:
+        main.write_local_file(task, {"path": "notes.txt", "content": "blocked"})
+        assert False, "acceptance stage should not allow file changes"
+    except ValueError as error:
+        assert "stage or permission" in str(error)
+    assert not (repo / "notes.txt").exists()
 
 
 def test_context_usage_and_model_compression_keep_chat_history(monkeypatch, tmp_path: Path) -> None:
@@ -180,6 +193,7 @@ def test_streamed_conversation_emits_activity_tokens_and_completion(monkeypatch,
     try:
         response = client.post(f"/api/tasks/{task['id']}/messages/stream", json={"content": "stream this"})
         assert response.status_code == 200
+        assert "event: workflow" in response.text
         assert "event: activity" in response.text
         assert "event: token" in response.text
         assert "streamed answer" in response.text

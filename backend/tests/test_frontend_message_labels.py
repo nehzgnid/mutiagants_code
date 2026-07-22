@@ -29,13 +29,12 @@ def test_completed_streaming_run_is_removed_after_history_refresh() -> None:
     assert "setRuns((items) => items.filter((run) => run.id !== runId));" in source
 
 
-def test_write_status_distinguishes_permission_approval_and_current_stage() -> None:
+def test_frontend_does_not_render_a_workflow_write_status() -> None:
     source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+    styles = (Path(__file__).parents[2] / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
 
-    assert "const writeStatus = (task: Task)" in source
-    assert "只读（权限设置）" in source
-    assert "只读（待编码确认）" in source
-    assert '只读（${task.current_stage || "当前阶段"}）' in source
+    assert "writeStatus" not in source
+    assert "write-status" not in styles
 
 
 def test_history_refresh_reloads_persisted_messages_before_removing_run() -> None:
@@ -62,3 +61,12 @@ def test_stage_trace_shows_only_the_agents_in_an_arrow_flow() -> None:
     assert "workflow-arrow" in source
     assert "workflow-plan" in styles
     assert "workflow-agent-flow" in styles
+
+
+def test_streaming_run_receives_and_renders_the_master_workflow_before_completion() -> None:
+    source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+
+    assert 'if (eventName === "workflow")' in source
+    assert "workflow: payload" in source
+    assert "function AgentFlow" in source
+    assert "{run.workflow && <AgentFlow decision={run.workflow} />}" in source

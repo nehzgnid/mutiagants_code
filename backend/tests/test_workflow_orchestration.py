@@ -222,7 +222,7 @@ def test_master_agent_can_plan_only_remaining_stages_from_persisted_context(monk
         remove_workspace_by_path(repo)
 
 
-def test_master_agent_adds_implementation_for_write_requests(monkeypatch, tmp_path: Path) -> None:
+def test_master_agent_plan_is_not_changed_by_keyword_heuristics(monkeypatch, tmp_path: Path) -> None:
     repo = tmp_path / "write-intent-route"
     init_clean_repo(repo)
     provider = ModelProvider(id=str(uuid.uuid4()), name="write-intent-router", kind="external", base_url="https://example.test/v1",
@@ -241,7 +241,7 @@ def test_master_agent_adds_implementation_for_write_requests(monkeypatch, tmp_pa
         task = main.Task(id=str(uuid.uuid4()), workspace_id="workspace", title="Java 示例", requirement="", status="created",
                          current_stage=main.CODE_REVIEW_STAGE, created_at=main.now(), updated_at=main.now())
         decision = main.master_agent_route(provider, task, "使用 Java 写一个 HelloWorld，并编译")
-        assert decision.required_stages == [main.IMPLEMENTATION_STAGE, main.CODE_REVIEW_STAGE]
+        assert decision.required_stages == [main.CODE_REVIEW_STAGE]
     finally:
         remove_workspace_by_path(repo)
 

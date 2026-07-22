@@ -42,7 +42,6 @@ type Task = {
   title: string;
   requirement: string;
   permission_mode: PermissionMode;
-  write_enabled: boolean;
   execution_mode: ExecutionMode;
   execution_mode_locked: boolean;
   status: string;
@@ -75,6 +74,7 @@ type Run = {
   activities: ActivityItem[];
   files: ChangedFile[];
   complete: boolean;
+  workflow?: RoutingDecision;
   error?: string;
   retryContent?: string;
 };
@@ -110,15 +110,6 @@ const permissionLabels: Record<PermissionMode, string> = {
 const executionModeLabels: Record<ExecutionMode, string> = {
   confirm_before_coding: "计划模式",
   automatic: "自动编码",
-};
-const writeStatus = (task: Task) => {
-  if (task.write_enabled)
-    return { label: "可修改文件", title: "当前阶段允许修改任务工作区文件" };
-  if (task.permission_mode === "read-only")
-    return { label: "只读（权限设置）", title: "请选择“工作区读写”或“完全访问”以允许编码阶段修改文件" };
-  if (task.current_stage === "待编码确认")
-    return { label: "只读（待编码确认）", title: "确认开始编码后，编码实现和修复阶段可以修改文件" };
-  return { label: `只读（${task.current_stage || "当前阶段"}）`, title: "当前阶段不允许修改文件；编码实现和修复阶段可以修改文件" };
 };
 const mcpAccessLabels: Record<McpAccessMode, string> = {
   "read-only": "只读",
@@ -326,6 +317,8 @@ function App() {
               ...run,
               activities: [...run.activities, payload],
             }));
+          if (eventName === "workflow")
+            updateRun(runId, (run) => ({ ...run, workflow: payload }));
           if (eventName === "done") {
             setContextUsage(payload.context);
             updateRun(runId, (run) => ({
@@ -548,12 +541,6 @@ function App() {
             <div className="chat-shell">
               <div className="chat-title">
                 <h1>{selected.title}</h1>
-                <span
-                  className={`write-status ${selected.write_enabled ? "enabled" : "disabled"}`}
-                  title={writeStatus(selected).title}
-                >
-                  {writeStatus(selected).label}
-                </span>
               </div>
               <div className="message-list" ref={messageListRef}>
                 {messages.length === 0 && (
@@ -858,29 +845,32 @@ const stageAgents: Record<string, string> = {
   "单元测试": "测试 Agent",
 };
 
+function AgentFlow({ decision }: { decision: RoutingDecision }) {
+  const agentFlow = Array.from(new Set(["主 Agent", ...decision.required_stages.map((stage) => stageAgents[stage] ?? "Agent")]));
+  return (
+    <div className="workflow-plan">
+      <p className="workflow-plan-title">协作流程</p>
+      <div className="workflow-agent-flow">
+        {agentFlow.map((agent, index) => (
+          <span className="workflow-agent" key={agent}>
+            {index > 0 && <span className="workflow-arrow">→</span>}
+            {agent}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function StageRunTrace({ run, task }: { run: StageRun; task: Task }) {
   const decision = task.routing_decision;
-  const plannedStages = decision?.required_stages ?? [run.stage];
-  const agentFlow = Array.from(new Set(["主 Agent", ...plannedStages.map((stage) => stageAgents[stage] ?? "Agent")]));
   return (
     <details className="activity-trace completed-trace">
       <summary>
         <Activity size={15} /> 工作过程
       </summary>
       <div>
-        {decision && (
-          <div className="workflow-plan">
-            <p className="workflow-plan-title">协作流程</p>
-            <div className="workflow-agent-flow">
-              {agentFlow.map((agent, index) => (
-                <span className="workflow-agent" key={agent}>
-                  {index > 0 && <span className="workflow-arrow">→</span>}
-                  {agent}
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
+        {decision && <AgentFlow decision={decision} />}
         <p className="activity agent">
           <CircleDot size={14} />
           <span>
@@ -910,6 +900,7 @@ function RunOutput({ run, taskId, onRetry }: { run: Run; taskId: string; onRetry
           <Activity size={15} /> {run.complete ? (run.title ?? "工作过程") : (run.title ?? "Agent 正在工作")}
         </summary>
         <div>
+          {run.workflow && <AgentFlow decision={run.workflow} />}
           {run.activities.map((item, index) => (
             <p
               className={`activity ${item.kind}`}

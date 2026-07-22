@@ -227,7 +227,6 @@ STAGE_AGENTS = {
     UNIT_TESTING_STAGE: "测试 Agent", FIXING_STAGE: "执行 Agent",
 }
 CONFIRMATION_KEYWORDS = ("确认", "继续", "执行", "开始编码", "开始实现", "同意")
-WRITE_ACTION_KEYWORDS = ("创建", "新建", "新增", "编写", "实现", "修改", "修复", "删除", "重命名", "生成", "编译", "运行", "执行", "部署")
 
 
 class RoutingDecision(BaseModel):
@@ -262,29 +261,6 @@ def validate_routing_decision(payload: Any) -> RoutingDecision:
     if ordered_positions != sorted(ordered_positions):
         raise ValueError("required_stages must preserve the approved stage order.")
     return decision
-
-
-def requires_write_stage(content: str) -> bool:
-    normalized = content.lower()
-    return any(keyword in content for keyword in WRITE_ACTION_KEYWORDS) or any(
-        keyword in normalized for keyword in ("create", "write", "implement", "modify", "fix", "delete", "rename", "compile", "run", "deploy")
-    )
-
-
-def require_implementation_stage(decision: RoutingDecision, content: str) -> RoutingDecision:
-    """Ensure requests that need write or command tools reach a writable stage."""
-    if decision.task_type != "development" or not requires_write_stage(content):
-        return decision
-    if any(stage in {IMPLEMENTATION_STAGE, FIXING_STAGE} for stage in decision.required_stages):
-        return decision
-    stages = list(decision.required_stages)
-    implementation_position = DEVELOPMENT_STAGES.index(IMPLEMENTATION_STAGE)
-    insert_at = next(
-        (index for index, stage in enumerate(stages) if DEVELOPMENT_STAGES.index(stage) > implementation_position),
-        len(stages),
-    )
-    stages.insert(insert_at, IMPLEMENTATION_STAGE)
-    return decision.model_copy(update={"required_stages": stages})
 
 
 class RoutingError(Exception):
@@ -346,7 +322,7 @@ def master_agent_route(provider: ModelProvider, task: Task, content: str, contex
         if not isinstance(raw, str):
             raise ValueError("The master agent did not return JSON text.")
         decision = validate_routing_decision(json.loads(raw))
-        return require_implementation_stage(decision, content)
+        return decision
     except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise RoutingError(f"主 Agent 路由失败：{type(error).__name__}: {error}") from error
 
@@ -640,8 +616,8 @@ def read_local_file(task: Task, arguments: dict[str, Any]) -> str:
 
 
 def write_local_file(task: Task, arguments: dict[str, Any]) -> str:
-    if task.permission_mode == "read-only":
-        raise ValueError("Read-only mode does not allow file changes.")
+    if not write_enabled(task):
+        raise ValueError("The current task stage or permission does not allow file changes.")
     target = resolve_tool_path(task.worktree_path, str(arguments["path"]), task.permission_mode)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(str(arguments["content"]), encoding="utf-8")
@@ -1297,6 +1273,7 @@ def stream_task_message(task_id: str, payload: MessageInput) -> StreamingRespons
         stage_run_id = stage_run.id if stage_run else None
         task.updated_at = now()
         db.commit()
+        workflow_payload = task.routing_decision if isinstance(task.routing_decision, dict) else None
         history = [{"role": message.role, "content": message.content} for message in db.scalars(
             select(TaskMessage).where(
                 TaskMessage.task_id == task_id,
@@ -1308,6 +1285,8 @@ def stream_task_message(task_id: str, payload: MessageInput) -> StreamingRespons
 
     def event_stream():
         answer = ""
+        if workflow_payload:
+            yield sse("workflow", workflow_payload)
         yield sse("activity", {"kind": "agent", "title": task.assigned_agent, "detail": f"正在执行{task.current_stage}（{task.workflow_type}流程）"})
         try:
             for _ in range(12):

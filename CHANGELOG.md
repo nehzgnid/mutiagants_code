@@ -987,6 +987,41 @@ Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed
 
 ### Plan
 
+- Requirements analysis: collaboration flow was rendered only from the persisted completed reply, so users could not see the selected Agent chain after the master Agent had already planned the work.
+- High-level design: emit the validated routing decision as a dedicated streaming event before the assigned Agent begins its model response, then render the Agent-only arrow flow in the active run card.
+- Detailed design: preserve the same routing-decision schema for the event payload, store it on the client-side run, and reuse the arrow-flow component for both active and persisted stage traces.
+
+Verification: traced the master-routing, task-stage creation, SSE generator, and frontend stream-consumption paths.
+
+### Code
+
+- Added a `workflow` Server-Sent Event immediately after master-Agent planning and before the first execution activity.
+- Updated the streaming conversation UI to show the planned Agent arrow chain as soon as that event arrives, without waiting for the final response or history refresh.
+
+Verification: `npm --prefix frontend run build` passed; `git diff --check` passed.
+
+### Code Review
+
+- Confirmed the plan event is emitted only after a validated decision is persisted, and reuses the existing routing contract without exposing model reasoning or changing stage permissions.
+
+Verification: static review of `backend/app/main.py` and `frontend/src/main.tsx`.
+
+### Unit Testing
+
+- Added assertions for streamed workflow events and for immediate client rendering of the workflow flow.
+
+Verification: focused stream and frontend tests passed with 14 tests; full backend verification is pending final execution.
+
+### Documentation
+
+- Verification update: completed the full backend regression suite for immediate workflow-plan streaming.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 41 tests and 1 existing Starlette deprecation warning.
+
+## 2026-07-22
+
+### Plan
+
 - Requirements analysis: user messages already have a distinct visual surface, so repeating the `你` role label is unnecessary visual noise.
 - High-level design: retain the Agent label that identifies generated work, while rendering user messages without a role-label element.
 - Detailed design: conditionally render `.message-role` only for assistant messages and protect the behavior with a focused frontend source contract.
@@ -1581,3 +1616,62 @@ Verification: static review of `frontend/src/main.tsx` and `frontend/src/styles.
 - Updated the frontend layout contract to require the header group and the explicit composer ordering rules.
 
 Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_mcp_configuration.py -q` passed with 2 tests; `npm --prefix frontend run build` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: remove the title-level workflow write-status marker and make file-write authorization a backend-only decision.
+- High-level design: leave the user-selected permission control visible, remove the derived frontend stage indicator, and enforce the existing permission-plus-stage rule immediately before local file writes.
+- Detailed design: remove `writeStatus`, its rendered badge, and its styles; require `write_enabled(task)` in `write_local_file`; add a regression test for an acceptance-stage write attempt.
+
+Verification: reviewed the frontend title renderer, local write handler, and existing file-write tests.
+
+### Code
+
+- Removed the title write-status badge and its frontend-only state calculation.
+- Enforced permission and writable-stage validation in the backend immediately before a local file is written.
+
+Verification: focused tests and frontend production build passed.
+
+### Code Review
+
+- Confirmed the frontend no longer makes or presents an authorization decision, while the backend continues to limit valid writes to `编码实现` and `修复` with a writable permission.
+- Confirmed the new validation runs before path resolution, directory creation, and file writes.
+
+Verification: static review of `frontend/src/main.tsx`, `frontend/src/styles.css`, and `backend/app/main.py`; `git diff --check` passed.
+
+### Unit Testing
+
+- Replaced the removed-badge contract with an absence check and added acceptance-stage rejection coverage for `write_local_file`.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py backend\\tests\\test_frontend_message_labels.py -q` passed with 13 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: route stage selection must be determined by the master Agent rather than keyword-based backend heuristics.
+- High-level design: retain backend validation of the Agent's plan format and approved stage order, while removing backend inference that inserts `编码实现` from request text.
+- Detailed design: remove write-action keyword matching and the implementation-stage insertion helper; return the validated routing decision unchanged.
+
+Verification: reviewed the master-Agent routing path and the heuristic-specific regression test.
+
+### Code
+
+- Removed keyword-triggered insertion of `编码实现`; the backend now preserves the master Agent's validated stage plan.
+
+Verification: focused routing tests and frontend production build passed.
+
+### Code Review
+
+- Confirmed routing decisions still reject invalid task-type, stage-membership, duplicated-stage, and stage-order contracts before any task state changes.
+- Confirmed file writes remain independently protected by backend permission and current-stage checks.
+
+Verification: static review of `backend/app/main.py`; `git diff --check` passed.
+
+### Unit Testing
+
+- Updated routing coverage to verify a message containing write-related terms does not alter the master Agent's returned plan.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_workflow_orchestration.py -q` passed with 9 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
