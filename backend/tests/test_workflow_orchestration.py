@@ -106,7 +106,7 @@ def test_master_agent_uses_full_route_and_requires_confirmation_before_coding(tm
         remove_workspace_by_path(repo)
 
 
-def test_automatic_mode_skips_coding_confirmation_and_locks_after_coding(tmp_path: Path) -> None:
+def test_automatic_mode_locks_only_while_coding_is_running(tmp_path: Path) -> None:
     repo = tmp_path / "automatic-workflow"
     init_clean_repo(repo)
     try:
@@ -125,10 +125,12 @@ def test_automatic_mode_skips_coding_confirmation_and_locks_after_coding(tmp_pat
             detail = main.start_stage(db, record, main.DETAILED_DESIGN_STAGE, "继续")
             main.complete_stage(db, record.id, detail.id, "详细")
             assert record.current_stage == main.IMPLEMENTATION_STAGE
-            assert main.execution_mode_locked(record)
+            assert not main.execution_mode_locked(record)
             implementation = main.start_stage(db, record, main.IMPLEMENTATION_STAGE, "自动继续")
+            assert main.execution_mode_locked(record)
             main.complete_stage(db, record.id, implementation.id, "实现")
             assert record.current_stage == main.CODE_REVIEW_STAGE
+            assert not main.execution_mode_locked(record)
             review = main.start_stage(db, record, main.CODE_REVIEW_STAGE, "自动继续")
             main.complete_stage(db, record.id, review.id, "审核")
             assert record.current_stage == main.UNIT_TESTING_STAGE
@@ -136,8 +138,9 @@ def test_automatic_mode_skips_coding_confirmation_and_locks_after_coding(tmp_pat
             main.complete_stage(db, record.id, tests.id, "测试")
             assert record.current_stage == main.AWAIT_ACCEPTANCE_STAGE
             db.commit()
-        locked = client.patch(f"/api/tasks/{task['id']}/execution-mode", json={"execution_mode": "confirm_before_coding"})
-        assert locked.status_code == 409
+        updated = client.patch(f"/api/tasks/{task['id']}/execution-mode", json={"execution_mode": "confirm_before_coding"})
+        assert updated.status_code == 200
+        assert updated.json()["execution_mode"] == "confirm_before_coding"
     finally:
         remove_workspace_by_path(repo)
 
@@ -215,6 +218,30 @@ def test_master_agent_can_plan_only_remaining_stages_from_persisted_context(monk
             prompt = captured["messages"][1]["content"]
             assert "概要和详细设计已经确认" in prompt
             assert main.DETAILED_DESIGN_STAGE in prompt
+    finally:
+        remove_workspace_by_path(repo)
+
+
+def test_master_agent_adds_implementation_for_write_requests(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "write-intent-route"
+    init_clean_repo(repo)
+    provider = ModelProvider(id=str(uuid.uuid4()), name="write-intent-router", kind="external", base_url="https://example.test/v1",
+                             model_name="test-model", is_active=True, created_at=main.now())
+
+    class Response:
+        def raise_for_status(self) -> None: pass
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": json.dumps({
+                "task_type": "development", "complexity_reason": "误判为只需审核", "workflow": "simple",
+                "required_stages": [main.CODE_REVIEW_STAGE],
+            }, ensure_ascii=False)}}]}
+
+    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: Response())
+    try:
+        task = main.Task(id=str(uuid.uuid4()), workspace_id="workspace", title="Java 示例", requirement="", status="created",
+                         current_stage=main.CODE_REVIEW_STAGE, created_at=main.now(), updated_at=main.now())
+        decision = main.master_agent_route(provider, task, "使用 Java 写一个 HelloWorld，并编译")
+        assert decision.required_stages == [main.IMPLEMENTATION_STAGE, main.CODE_REVIEW_STAGE]
     finally:
         remove_workspace_by_path(repo)
 

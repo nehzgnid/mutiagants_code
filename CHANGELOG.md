@@ -137,6 +137,12 @@ Verification: pending execution.
 
 ### Verification Update
 
+- Completed the pending validation for the 20-message conversation window change.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_conversation_viewport.py -q` passed with 2 tests; `npm --prefix frontend run build` and `git diff --check` passed.
+
+### Verification Update
+
 - Executed the full backend test suite, Python compilation, frontend production build, and a static search for removed public workspace references.
 
 Verification: `.\.venv\Scripts\python.exe -m pytest backend\tests -q` passed with 6 tests and 1 existing Starlette deprecation warning; `.\.venv\Scripts\python.exe -m py_compile backend\app\main.py backend\tests\test_task_sources.py` passed; `npm --prefix frontend run build` passed. Static search found workspace references only in server-side persistence and patch/test safety paths.
@@ -942,6 +948,75 @@ Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, a
 
 Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 23 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
 
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: the detailed workflow card made collaboration harder to scan when users only needed to see which Agents participate in the planned sequence.
+- High-level design: show a compact, ordered Agent-only chain above the individual stage record, omitting unused Agents and stage metadata from the collaboration summary.
+- Detailed design: derive assigned Agent names from the selected stage plan, remove duplicate Agent names while preserving their first-use order, and render adjacent Agents with arrow separators.
+
+Verification: reviewed the workflow-trace rendering, the persisted routing decision contract, and the requested JWT workflow example.
+
+### Code
+
+- Replaced the expanded plan-stage list with an arrow-linked Agent collaboration flow such as `主 Agent → 执行 Agent → 审查 Agent → 测试 Agent`.
+- Kept the existing stage execution record below the flow so the completed or active operation remains visible without duplicating the planning details.
+
+Verification: `npm --prefix frontend run build` passed; `git diff --check` passed.
+
+### Code Review
+
+- Confirmed the flow displays only Agents selected by the current routing plan, de-duplicates a repeated Agent, and does not alter workflow transitions or permission checks.
+
+Verification: static review of `frontend/src/main.tsx` and `frontend/src/styles.css`.
+
+### Unit Testing
+
+- Updated the frontend rendering contract to require the arrow-flow container and Agent-flow calculation.
+
+Verification: focused frontend test passed with 8 tests; full backend verification is pending final execution.
+
+### Documentation
+
+- Verification update: full backend verification completed after the workflow-flow entry was recorded.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 38 tests and 1 existing Starlette deprecation warning; `git diff --check` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: user messages already have a distinct visual surface, so repeating the `你` role label is unnecessary visual noise.
+- High-level design: retain the Agent label that identifies generated work, while rendering user messages without a role-label element.
+- Detailed design: conditionally render `.message-role` only for assistant messages and protect the behavior with a focused frontend source contract.
+
+Verification: inspected the conversation message renderer and its role-label test coverage.
+
+### Code
+
+- Removed the visible `你` label from user conversation bubbles; Agent responses continue to show `Agent`.
+
+Verification: `npm --prefix frontend run build` passed; `git diff --check` passed.
+
+### Code Review
+
+- Confirmed the change affects display only and does not alter message ordering, stored roles, Markdown rendering, or streaming behavior.
+
+Verification: static review of `frontend/src/main.tsx`.
+
+### Unit Testing
+
+- Updated the frontend role-label test to require an Agent-only label and reject the prior user-label conditional.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_message_labels.py -q` passed with 8 tests; full backend verification is pending final execution.
+
+### Documentation
+
+- Verification update: completed the final backend regression suite for the user-label display adjustment.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 38 tests and 1 existing Starlette deprecation warning.
+
 ## 2026-07-21
 
 ### Plan
@@ -972,7 +1047,183 @@ Verification: static review of backend routing, UI configuration, and MCP-focuse
 
 - Added real stdio MCP coverage for discovery, call routing, duplicate and unavailable server handling, access classes, and UI configuration contracts.
 
-Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 26 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 26 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed. Focused control-placement verification is recorded below.
+
+## 2026-07-22
+
+### Verification Update
+
+- Final verification completed for the requested control placement adjustment; the result is recorded below.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_mcp_configuration.py -q` passed with 2 tests; `npm --prefix frontend run build` and `git diff --check` passed.
+
+## 2026-07-22
+
+### Verification Update
+
+- Completed the focused control-order verification and frontend production build for the adjacent MCP/model and execution-mode/permission controls.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_mcp_configuration.py -q` passed with 2 tests; `npm --prefix frontend run build` and `git diff --check` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: place the model-interface control immediately beside MCP Server, and place the execution-mode control immediately beside Agent permissions.
+- High-level design: reorder only the corresponding sibling controls, retaining all state, callbacks, menu behavior, and responsive styling.
+- Detailed design: render MCP Server before model-interface in the header, and render execution-mode before permissions in the composer footer; assert both source-order relationships.
+
+Verification: inspected the header, composer footer, and existing frontend configuration contracts.
+
+### Code
+
+- Reordered the model-interface and MCP Server controls, plus the execution-mode and permission controls, so each related pair is adjacent in the requested order.
+
+Verification: pending unit test and production build execution.
+
+### Code Review
+
+- Confirmed the change only moves sibling JSX blocks and preserves the existing handlers, disabled state, menu anchoring, and CSS classes.
+
+Verification: static review of `frontend/src/main.tsx`.
+
+### Unit Testing
+
+- Added a frontend contract test for the two requested control-order relationships.
+
+Verification: pending execution.
+
+## 2026-07-22
+
+### Verification Update
+
+- Completed verification for automatic insertion of `编码实现` when a coding or command-execution request is incorrectly routed directly to review or testing.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_workflow_orchestration.py -q` passed with 9 tests and 1 existing Starlette deprecation warning; `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 38 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` and `git diff --check` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: coding and command-execution requests must automatically enter a writable stage rather than relying on the user to request `编码实现` explicitly.
+- High-level design: retain model-selected plans for read-only and review work, while adding a server-side guard that inserts `编码实现` when the incoming request has a clear write or execution intent.
+- Detailed design: identify Chinese and English create/modify/compile/run/deploy intent keywords; when the model omits both writable stages, insert `编码实现` before review or testing and preserve the approved stage order.
+
+Verification: reviewed routing prompt construction, route validation, stage ordering, write-tool gating, and existing replanning tests.
+
+### Code
+
+- Strengthened the master-agent routing prompt and added a server-side implementation-stage guard for requests that require creating, modifying, compiling, running, or deploying code.
+
+Verification: pending unit test and production build execution.
+
+### Code Review
+
+- Confirmed the guard applies only to development requests with a recognized write or execution intent; pure read-only analysis and explicit review-only work remain unchanged.
+- Confirmed the inserted stage appears before review or testing, so the existing write-tool and command-tool permission checks remain authoritative.
+
+Verification: static review of `backend/app/main.py` and `backend/tests/test_workflow_orchestration.py`.
+
+### Unit Testing
+
+- Added a routing test where the model incorrectly returns only code review for a Java creation and compilation request.
+
+Verification: pending execution.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: a completed conversation must allow its execution mode to be changed again, and the task header must not describe every non-writable state as pending coding confirmation.
+- High-level design: lock execution-mode changes only while a write-capable stage is actively running; derive the header status from the existing permission, stage, and write-enabled task fields.
+- Detailed design: treat only in-progress `编码实现` and `修复` stages as mode-locked; render separate labels for writable, read-only permission, pending coding approval, and other non-writable stages.
+
+Verification: reviewed task serialization, stage completion status transitions, execution-mode API guards, frontend workflow refresh, and the existing orchestration test coverage.
+
+### Code
+
+- Released the execution-mode selector after a coding or repair run completes, while retaining the lock during an active write-capable run.
+- Replaced the generic `只读（待编码确认）` header with status-specific permission, approval, and current-stage labels.
+
+Verification: pending unit test and production build execution.
+
+### Code Review
+
+- Confirmed write-tool authorization remains server-side and unchanged: only writable permissions during `编码实现` or `修复` expose file writes.
+- Confirmed changing the execution mode cannot interrupt an in-progress coding or repair run.
+
+Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, and `backend/tests/test_workflow_orchestration.py`.
+
+### Unit Testing
+
+- Updated orchestration coverage for the selector lock during active coding and its release after completion.
+
+Verification: pending execution.
+
+### Verification Update
+
+- Verified the execution-mode lock and status-label changes with focused workflow and frontend rendering-contract tests, the complete backend suite, and a frontend production build.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_workflow_orchestration.py -q` passed with 8 tests and 1 existing Starlette deprecation warning; `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 37 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` and `git diff --check` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: selecting a task must open its conversation at the newest content, and long histories must avoid mounting every message at once.
+- High-level design: retain the existing complete client-side history and backend API, while mounting a recent-message window that can expand toward older history on demand.
+- Detailed design: reset the window to the latest 80 messages on every task click, use the message-list scroll container to move to its bottom after layout, and add 80 older messages per explicit load action.
+
+Verification: reviewed the task-selection handler, history-fetch effect, message-list rendering path, streaming refresh behavior, and existing frontend source-contract test conventions.
+
+### Code
+
+- Added latest-message focus when a task is clicked, including repeat clicks on the already active task.
+- Added incremental long-history rendering: the initial view mounts only the newest 80 messages and can load earlier messages in 80-message batches without losing access to history.
+- Added focused frontend contract tests for the selection scroll behavior and recent-message rendering window.
+
+Verification: `git diff --check` passed; `npm --prefix frontend run build` passed.
+
+### Code Review
+
+- Confirmed that the render window changes presentation only: task history requests, message submission, streamed replies, stage traces, and backend conversation context continue to use the complete ordered history.
+- Confirmed expanding older history does not force-scroll the reader back to the latest message, while task selection and new message/run list changes do.
+
+Verification: static review of `frontend/src/main.tsx`, `frontend/src/styles.css`, and `backend/tests/test_frontend_conversation_viewport.py`; `git diff --check` passed.
+
+### Unit Testing
+
+- Ran the full backend test suite, including the new frontend rendering contracts, and the frontend production build.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 36 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: reduce the initial and incremental conversation render window from 80 messages to 20 messages.
+- High-level design: retain the existing recent-window mechanism and adjust only its shared batch-size constant.
+- Detailed design: set `INITIAL_RENDERED_MESSAGES` to 20 so both task selection and the earlier-history action use the requested count.
+
+Verification: reviewed the shared window constant and its frontend contract test.
+
+### Code
+
+- Changed the conversation render window and older-history batch size to 20 messages.
+
+Verification: pending unit test and production build execution.
+
+### Code Review
+
+- Confirmed the single constant continues to control both the initial render and incremental history loading, with no change to message ordering or latest-message focus.
+
+Verification: static review of `frontend/src/main.tsx` and `backend/tests/test_frontend_conversation_viewport.py`.
+
+### Unit Testing
+
+- Updated the frontend rendering contract to assert the requested 20-message window.
+
+Verification: pending execution.
 
 
 
@@ -1293,3 +1544,40 @@ Verification: static review of backend routing, UI configuration, and MCP-focuse
 - Added real stdio MCP coverage for discovery, call routing, duplicate and unavailable server handling, access classes, and UI configuration contracts.
 
 Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 26 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
+
+## 2026-07-22
+
+### Verification Update
+
+- Final verification completed for the requested control placement adjustment.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_mcp_configuration.py -q` passed with 2 tests; `npm --prefix frontend run build` and `git diff --check` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: keep the model and MCP controls together at the top right, and keep permission plus execution-mode controls together at the bottom left; the request is grouping, not an exchange of their page positions.
+- High-level design: introduce a dedicated header action group and use flex ordering in the composer footer to keep the two left-side controls adjacent while preserving the right-side action group.
+- Detailed design: render model configuration before MCP Server inside `.header-actions`; order permissions first and execution mode second, then apply `margin-left: auto` to `.composer-actions`.
+
+Verification: inspected the rendered header geometry and the composer control structure.
+
+### Code
+
+- Grouped the model-interface and MCP Server buttons at the top right, with model configuration on the left of MCP Server.
+- Positioned permissions immediately before plan-mode/automatic-coding at the bottom left, while retaining the existing model selector and send controls on the right.
+
+Verification: browser inspection confirmed the header pair is adjacent in one right-aligned group with a 9px gap.
+
+### Code Review
+
+- Confirmed all existing callbacks, disabled states, dropdown anchoring, and responsive icon-only behavior remain unchanged; only layout structure and flex ordering changed.
+
+Verification: static review of `frontend/src/main.tsx` and `frontend/src/styles.css`; `git diff --check` passed.
+
+### Unit Testing
+
+- Updated the frontend layout contract to require the header group and the explicit composer ordering rules.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_mcp_configuration.py -q` passed with 2 tests; `npm --prefix frontend run build` passed.

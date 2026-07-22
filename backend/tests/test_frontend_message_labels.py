@@ -1,11 +1,11 @@
 from pathlib import Path
 
 
-def test_each_persisted_message_renders_its_role_label() -> None:
+def test_only_agent_messages_render_a_role_label() -> None:
     source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
 
-    assert 'message.role === "user" ? "你" : "Agent"' in source
-    assert '<div className="message-role">' in source
+    assert '{message.role === "assistant" && <div className="message-role">Agent</div>}' in source
+    assert 'message.role === "user" ? "你" : "Agent"' not in source
 
 
 def test_persisted_agent_messages_use_markdown_renderer() -> None:
@@ -29,6 +29,15 @@ def test_completed_streaming_run_is_removed_after_history_refresh() -> None:
     assert "setRuns((items) => items.filter((run) => run.id !== runId));" in source
 
 
+def test_write_status_distinguishes_permission_approval_and_current_stage() -> None:
+    source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+
+    assert "const writeStatus = (task: Task)" in source
+    assert "只读（权限设置）" in source
+    assert "只读（待编码确认）" in source
+    assert '只读（${task.current_stage || "当前阶段"}）' in source
+
+
 def test_history_refresh_reloads_persisted_messages_before_removing_run() -> None:
     source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
 
@@ -44,12 +53,12 @@ def test_completed_agent_reply_renders_an_expandable_stage_trace() -> None:
     assert "stageRuns.find((run) => run.output === message.content)" in source
 
 
-def test_stage_trace_shows_the_master_plan_and_stage_statuses() -> None:
+def test_stage_trace_shows_only_the_agents_in_an_arrow_flow() -> None:
     source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
     styles = (Path(__file__).parents[2] / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
 
-    assert "主 Agent 协作计划" in source
-    assert "workflowStageState" in source
-    assert "等待编码确认" in source
+    assert "协作流程" in source
+    assert "const agentFlow" in source
+    assert "workflow-arrow" in source
     assert "workflow-plan" in styles
-    assert "workflow-step" in styles
+    assert "workflow-agent-flow" in styles

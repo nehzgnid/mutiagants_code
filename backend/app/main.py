@@ -208,10 +208,9 @@ COMPLETED_STAGE = "已完成"
 
 
 def execution_mode_locked(task: Task) -> bool:
-    """Execution mode is immutable from the first implementation stage onward."""
-    return task.workflow_type in {"simple", "full"} and task.current_stage in {
-        IMPLEMENTATION_STAGE, CODE_REVIEW_STAGE, UNIT_TESTING_STAGE, FIXING_STAGE,
-        AWAIT_ACCEPTANCE_STAGE, COMPLETED_STAGE,
+    """Prevent mode changes only while a write-capable stage is running."""
+    return task.status == "in_progress" and task.current_stage in {
+        IMPLEMENTATION_STAGE, FIXING_STAGE,
     }
 
 
@@ -228,6 +227,7 @@ STAGE_AGENTS = {
     UNIT_TESTING_STAGE: "测试 Agent", FIXING_STAGE: "执行 Agent",
 }
 CONFIRMATION_KEYWORDS = ("确认", "继续", "执行", "开始编码", "开始实现", "同意")
+WRITE_ACTION_KEYWORDS = ("创建", "新建", "新增", "编写", "实现", "修改", "修复", "删除", "重命名", "生成", "编译", "运行", "执行", "部署")
 
 
 class RoutingDecision(BaseModel):
@@ -262,6 +262,29 @@ def validate_routing_decision(payload: Any) -> RoutingDecision:
     if ordered_positions != sorted(ordered_positions):
         raise ValueError("required_stages must preserve the approved stage order.")
     return decision
+
+
+def requires_write_stage(content: str) -> bool:
+    normalized = content.lower()
+    return any(keyword in content for keyword in WRITE_ACTION_KEYWORDS) or any(
+        keyword in normalized for keyword in ("create", "write", "implement", "modify", "fix", "delete", "rename", "compile", "run", "deploy")
+    )
+
+
+def require_implementation_stage(decision: RoutingDecision, content: str) -> RoutingDecision:
+    """Ensure requests that need write or command tools reach a writable stage."""
+    if decision.task_type != "development" or not requires_write_stage(content):
+        return decision
+    if any(stage in {IMPLEMENTATION_STAGE, FIXING_STAGE} for stage in decision.required_stages):
+        return decision
+    stages = list(decision.required_stages)
+    implementation_position = DEVELOPMENT_STAGES.index(IMPLEMENTATION_STAGE)
+    insert_at = next(
+        (index for index, stage in enumerate(stages) if DEVELOPMENT_STAGES.index(stage) > implementation_position),
+        len(stages),
+    )
+    stages.insert(insert_at, IMPLEMENTATION_STAGE)
+    return decision.model_copy(update={"required_stages": stages})
 
 
 class RoutingError(Exception):
@@ -304,6 +327,7 @@ def master_agent_route(provider: ModelProvider, task: Task, content: str, contex
         f"Allowed development stages, in the only valid order: {json.dumps(DEVELOPMENT_STAGES, ensure_ascii=False)}. "
         "Plan only the stages still needed for this request. Do not add requirements or design stages when the supplied context "
         "already contains adequate completed planning; start at implementation, review, testing, or another necessary later stage. "
+        "Requests to create, modify, compile, run, deploy, or otherwise execute code must include 编码实现 before review or testing. "
         "You may choose any ordered subset of the development stages, including a planning-only sequence. The workflow label is "
         "descriptive only: simple and full do not impose fixed stage lists. Use read_only only for requests that do not ask for a change. "
         f"Task title: {task.title}\nTask requirement: {task.requirement}\nPersisted task context: {context or '(none)'}\nIncoming message: {content}"
@@ -321,7 +345,8 @@ def master_agent_route(provider: ModelProvider, task: Task, content: str, contex
         raw = response.json()["choices"][0]["message"]["content"]
         if not isinstance(raw, str):
             raise ValueError("The master agent did not return JSON text.")
-        return validate_routing_decision(json.loads(raw))
+        decision = validate_routing_decision(json.loads(raw))
+        return require_implementation_stage(decision, content)
     except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise RoutingError(f"主 Agent 路由失败：{type(error).__name__}: {error}") from error
 

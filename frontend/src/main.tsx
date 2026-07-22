@@ -1,4 +1,4 @@
-import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   Activity,
   Bot,
@@ -92,6 +92,7 @@ type ContextUsage = {
   compacted_messages: number;
   compressible_messages: number;
 };
+const INITIAL_RENDERED_MESSAGES = 20;
 const api = async <T,>(url: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -109,6 +110,15 @@ const permissionLabels: Record<PermissionMode, string> = {
 const executionModeLabels: Record<ExecutionMode, string> = {
   confirm_before_coding: "计划模式",
   automatic: "自动编码",
+};
+const writeStatus = (task: Task) => {
+  if (task.write_enabled)
+    return { label: "可修改文件", title: "当前阶段允许修改任务工作区文件" };
+  if (task.permission_mode === "read-only")
+    return { label: "只读（权限设置）", title: "请选择“工作区读写”或“完全访问”以允许编码阶段修改文件" };
+  if (task.current_stage === "待编码确认")
+    return { label: "只读（待编码确认）", title: "确认开始编码后，编码实现和修复阶段可以修改文件" };
+  return { label: `只读（${task.current_stage || "当前阶段"}）`, title: "当前阶段不允许修改文件；编码实现和修复阶段可以修改文件" };
 };
 const mcpAccessLabels: Record<McpAccessMode, string> = {
   "read-only": "只读",
@@ -136,8 +146,11 @@ function App() {
     [showMcpServers, setShowMcpServers] = useState(false),
     [showModels, setShowModels] = useState(false),
     [showPermissions, setShowPermissions] = useState(false),
-    [showExecutionModes, setShowExecutionModes] = useState(false);
+    [showExecutionModes, setShowExecutionModes] = useState(false),
+    [renderedMessageCount, setRenderedMessageCount] = useState(INITIAL_RENDERED_MESSAGES),
+    [scrollToLatestRequest, setScrollToLatestRequest] = useState(0);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const messageListRef = useRef<HTMLDivElement>(null);
   const activeProvider =
     providers.find((provider) => provider.is_active) ?? null;
   const load = async () => {
@@ -193,6 +206,19 @@ function App() {
       })
       .catch((error) => setNotice(String(error).replace(/^Error: /, "")));
   }, [selected?.id]);
+  useLayoutEffect(() => {
+    if (scrollToLatestRequest === 0) return;
+    const messageList = messageListRef.current;
+    if (messageList)
+      messageList.scrollTop = messageList.scrollHeight;
+  }, [messages.length, runs.length, scrollToLatestRequest]);
+  const selectTask = (task: Task) => {
+    setRenderedMessageCount(INITIAL_RENDERED_MESSAGES);
+    setScrollToLatestRequest((request) => request + 1);
+    setSelected(task);
+  };
+  const renderedMessages = messages.slice(-renderedMessageCount);
+  const hiddenMessageCount = messages.length - renderedMessages.length;
   const selectProvider = async (provider: Provider) => {
     try {
       await api<Provider>(`/api/model-providers/${provider.id}/activate`, {
@@ -453,20 +479,22 @@ function App() {
           <Bot size={20} />
           <span>Agent Workbench</span>
         </div>
-        <button
-          className="settings-button"
-          title="配置模型接口"
-          onClick={() => setShowProviders(true)}
-        >
-          <Settings2 size={16} /> 配置模型接口
-        </button>
-        <button
-          className="settings-button"
-          title="配置本地 MCP Server"
-          onClick={() => setShowMcpServers(true)}
-        >
-          <TerminalSquare size={16} /> MCP Server
-        </button>
+        <div className="header-actions">
+          <button
+            className="settings-button"
+            title="配置模型接口"
+            onClick={() => setShowProviders(true)}
+          >
+            <Settings2 size={16} /> 配置模型接口
+          </button>
+          <button
+            className="settings-button"
+            title="配置本地 MCP Server"
+            onClick={() => setShowMcpServers(true)}
+          >
+            <TerminalSquare size={16} /> MCP Server
+          </button>
+        </div>
       </header>
       {notice && (
         <div className="notice">
@@ -489,7 +517,7 @@ function App() {
               className={`task-row ${selected?.id === task.id ? "active" : ""}`}
               key={task.id}
             >
-              <button className="task" onClick={() => setSelected(task)}>
+              <button className="task" onClick={() => selectTask(task)}>
                 <span>{task.title}</span>
               </button>
               <button
@@ -522,12 +550,12 @@ function App() {
                 <h1>{selected.title}</h1>
                 <span
                   className={`write-status ${selected.write_enabled ? "enabled" : "disabled"}`}
-                  title={selected.write_enabled ? "当前阶段允许修改任务工作区文件" : "文件写入会在编码实现或修复阶段启用；请先选择工作区读写权限并完成编码确认"}
+                  title={writeStatus(selected).title}
                 >
-                  {selected.write_enabled ? "可修改文件" : "只读（待编码确认）"}
+                  {writeStatus(selected).label}
                 </span>
               </div>
-              <div className="message-list">
+              <div className="message-list" ref={messageListRef}>
                 {messages.length === 0 && (
                   <div className="empty-chat">
                     <Activity size={34} />
@@ -535,7 +563,16 @@ function App() {
                     <p>描述你想完成的工作，Agent 会保留对话上下文。</p>
                   </div>
                 )}
-                {messages.map((message) => {
+                {hiddenMessageCount > 0 && (
+                  <button
+                    type="button"
+                    className="load-earlier-messages"
+                    onClick={() => setRenderedMessageCount((count) => count + INITIAL_RENDERED_MESSAGES)}
+                  >
+                    加载更早消息（{hiddenMessageCount}）
+                  </button>
+                )}
+                {renderedMessages.map((message) => {
                   const stageRun = message.role === "assistant"
                     ? stageRuns.find((run) => run.output === message.content)
                     : undefined;
@@ -544,9 +581,7 @@ function App() {
                       className={`message ${message.role}`}
                       key={message.id}
                     >
-                      <div className="message-role">
-                        {message.role === "user" ? "你" : "Agent"}
-                      </div>
+                      {message.role === "assistant" && <div className="message-role">Agent</div>}
                       {stageRun && <StageRunTrace run={stageRun} task={selected} />}
                       {message.role === "assistant" ? (
                         <MarkdownContent content={message.content} taskId={selected.id} />
@@ -575,6 +610,32 @@ function App() {
                   aria-label="消息内容"
                 />
                 <div className="composer-footer">
+                  <div className="execution-mode-picker">
+                    <button
+                      type="button"
+                      className="execution-mode-button"
+                      disabled={selected.execution_mode_locked}
+                      onClick={() => setShowExecutionModes((open) => !open)}
+                      title={selected.execution_mode_locked ? "正在编码或修复，执行模式暂时锁定" : "选择当前任务的执行模式"}
+                    >
+                      <Workflow size={15} />
+                      <span>{executionModeLabels[selected.execution_mode]}</span>
+                      <ChevronDown size={14} />
+                    </button>
+                    {showExecutionModes && !selected.execution_mode_locked && (
+                      <div className="execution-mode-menu">
+                        {(Object.keys(executionModeLabels) as ExecutionMode[]).map((mode) => (
+                          <button type="button" key={mode} className={selected.execution_mode === mode ? "selected" : ""} onClick={() => void selectExecutionMode(mode)}>
+                            <span>
+                              <strong>{executionModeLabels[mode]}</strong>
+                              <small>{mode === "confirm_before_coding" ? "完成分析与设计后，编码前等待确认" : "完成设计后连续进入编码、审核和测试"}</small>
+                            </span>
+                            {selected.execution_mode === mode && <Check size={15} />}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                   <div className="permission-picker">
                     <button
                       type="button"
@@ -614,32 +675,6 @@ function App() {
                             {selected.permission_mode === mode && (
                               <Check size={15} />
                             )}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  <div className="execution-mode-picker">
-                    <button
-                      type="button"
-                      className="execution-mode-button"
-                      disabled={selected.execution_mode_locked}
-                      onClick={() => setShowExecutionModes((open) => !open)}
-                      title={selected.execution_mode_locked ? "编码已开始，执行模式已锁定" : "选择当前任务的执行模式"}
-                    >
-                      <Workflow size={15} />
-                      <span>{executionModeLabels[selected.execution_mode]}</span>
-                      <ChevronDown size={14} />
-                    </button>
-                    {showExecutionModes && !selected.execution_mode_locked && (
-                      <div className="execution-mode-menu">
-                        {(Object.keys(executionModeLabels) as ExecutionMode[]).map((mode) => (
-                          <button type="button" key={mode} className={selected.execution_mode === mode ? "selected" : ""} onClick={() => void selectExecutionMode(mode)}>
-                            <span>
-                              <strong>{executionModeLabels[mode]}</strong>
-                              <small>{mode === "confirm_before_coding" ? "完成分析与设计后，编码前等待确认" : "完成设计后连续进入编码、审核和测试"}</small>
-                            </span>
-                            {selected.execution_mode === mode && <Check size={15} />}
                           </button>
                         ))}
                       </div>
@@ -823,20 +858,10 @@ const stageAgents: Record<string, string> = {
   "单元测试": "测试 Agent",
 };
 
-function workflowStageState(stage: string, task: Task, plannedStages: string[]) {
-  const currentIndex = plannedStages.indexOf(task.current_stage);
-  const stageIndex = plannedStages.indexOf(stage);
-  if (task.current_stage === "已完成") return "已完成";
-  if (task.current_stage === "待编码确认" && stage === "编码实现") return "等待编码确认";
-  if (currentIndex >= 0 && stageIndex < currentIndex) return "已完成";
-  if (currentIndex >= 0 && stageIndex === currentIndex)
-    return task.status === "awaiting_input" ? "等待继续" : "进行中";
-  return "待执行";
-}
-
 function StageRunTrace({ run, task }: { run: StageRun; task: Task }) {
   const decision = task.routing_decision;
   const plannedStages = decision?.required_stages ?? [run.stage];
+  const agentFlow = Array.from(new Set(["主 Agent", ...plannedStages.map((stage) => stageAgents[stage] ?? "Agent")]));
   return (
     <details className="activity-trace completed-trace">
       <summary>
@@ -845,23 +870,15 @@ function StageRunTrace({ run, task }: { run: StageRun; task: Task }) {
       <div>
         {decision && (
           <div className="workflow-plan">
-            <p className="workflow-plan-title">主 Agent 协作计划</p>
-            <p className="workflow-plan-reason">{decision.complexity_reason}</p>
-            <ol className="workflow-stages">
-              <li className="workflow-step completed">
-                <CircleDot size={14} />
-                <span><strong>主 Agent · 协作规划</strong>已完成</span>
-              </li>
-              {plannedStages.map((stage) => {
-                const state = workflowStageState(stage, task, plannedStages);
-                return (
-                  <li className={`workflow-step ${state === "已完成" ? "completed" : state === "待执行" ? "pending" : "current"}`} key={stage}>
-                    <CircleDot size={14} />
-                    <span><strong>{stageAgents[stage] ?? "Agent"} · {stage}</strong>{state}</span>
-                  </li>
-                );
-              })}
-            </ol>
+            <p className="workflow-plan-title">协作流程</p>
+            <div className="workflow-agent-flow">
+              {agentFlow.map((agent, index) => (
+                <span className="workflow-agent" key={agent}>
+                  {index > 0 && <span className="workflow-arrow">→</span>}
+                  {agent}
+                </span>
+              ))}
+            </div>
           </div>
         )}
         <p className="activity agent">
