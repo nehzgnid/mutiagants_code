@@ -245,7 +245,15 @@ def recover_interrupted_operations() -> None:
             operation.status = "failed"; operation.updated_at = now()
             operation.result = {**(operation.result or {}), "interrupted": True, "message": "Host restarted before the operation completed."}
             record_execution_event(db, operation.task_id, "failed", operation.result, operation.id)
-        if interrupted: db.commit()
+        interrupted_runs = list(db.scalars(select(AgentRun).where(AgentRun.status.in_({"running", "awaiting_approval"}))))
+        for run in interrupted_runs:
+            run.status, run.updated_at = "failed", now()
+            run.result = {**(run.result or {}), "error": "Host restarted before the Agent run completed."}
+            task = db.get(Task, run.task_id)
+            if task and task.status == "in_progress":
+                task.status, task.updated_at = "failed", now()
+            record_execution_event(db, run.task_id, "agent_run", {"run_id": run.id, "status": run.status, "result": run.result})
+        if interrupted or interrupted_runs: db.commit()
 
 
 def dump_task(item: Task) -> dict[str, Any]:
@@ -300,6 +308,15 @@ def write_enabled(task: Task) -> bool:
         IMPLEMENTATION_STAGE,
         FIXING_STAGE,
     }
+
+
+def task_can_write(task: Task) -> bool:
+    """Permission gate for the continuous main-Agent run.
+
+    Legacy stage workflows still use write_enabled(); new runs intentionally do
+    not need to enter an implementation stage before applying a patch.
+    """
+    return task.permission_mode in {"workspace-write", "full-access"}
 
 STAGE_AGENTS = {
     READ_ONLY_STAGE: "阅读 Agent", REQUIREMENTS_STAGE: "主 Agent", HIGH_LEVEL_DESIGN_STAGE: "阅读 Agent",
@@ -702,7 +719,10 @@ def update_agent_run(run_id: str, task_id: str, *, activity: dict[str, Any] | No
         if token:
             result["content"] = f"{result.get('content', '')}{token}"
         if file:
-            result["files"] = [*(result.get("files") or []), file]
+            files = [*(result.get("files") or [])]
+            if not any(item.get("path") == file.get("path") and item.get("action") == file.get("action") for item in files):
+                files.append(file)
+            result["files"] = files
         if workflow:
             result["workflow"] = workflow
         if error:
@@ -710,6 +730,21 @@ def update_agent_run(run_id: str, task_id: str, *, activity: dict[str, Any] | No
         run.result = result
         if status:
             run.status = status
+        run.updated_at = now()
+        record_execution_event(db, task_id, "agent_run", {"run_id": run_id, "status": run.status, "result": result})
+        db.commit()
+
+
+def save_agent_run_context(run_id: str, task_id: str, messages: list[dict[str, Any]], waiting_operation_id: str | None = None) -> None:
+    """Persist the tool conversation needed to explain or resume a paused run."""
+    with SessionLocal() as db:
+        run = db.get(AgentRun, run_id)
+        if not run:
+            return
+        result = dict(run.result or {})
+        result["conversation"] = messages
+        result["waiting_operation_id"] = waiting_operation_id
+        run.result = result
         run.updated_at = now()
         record_execution_event(db, task_id, "agent_run", {"run_id": run_id, "status": run.status, "result": result})
         db.commit()
@@ -768,7 +803,7 @@ def patch_preview(task: Task, db: Session, edits: list[dict[str, Any]]) -> tuple
         new_text = edit.get("new_text", "")
         if old_text is None:
             if before is not None:
-                raise ValueError(f"File already exists: {path}")
+                raise ValueError(f"File already exists: {path}. Use exact old_text/new_text edits for existing files; old_text=null is only for creating new files.")
             after = new_text
         else:
             if before is None or old_text not in before:
@@ -800,6 +835,10 @@ def execute_patch_operation(db: Session, operation: ExecutionOperation) -> None:
     except RuntimeError as error:
         operation.status = "conflict"; operation.result = json.loads(str(error)); operation.updated_at = now()
         record_execution_event(db, task.id, "conflict", operation.result, operation.id)
+        return
+    except ValueError as error:
+        operation.status = "failed"; operation.result = {"message": str(error)}; operation.updated_at = now()
+        record_execution_event(db, task.id, "failed", operation.result, operation.id)
         return
     apply_prepared_patch(prepared)
     operation.status = "completed"; operation.snapshot = snapshot
@@ -883,8 +922,8 @@ def read_local_file(task: Task, arguments: dict[str, Any]) -> str:
 
 
 def apply_local_patch(task: Task, arguments: dict[str, Any], db: Session) -> str:
-    if not write_enabled(task):
-        raise ValueError("The current task stage or permission does not allow file changes.")
+    if not task_can_write(task):
+        raise ValueError("The task permission does not allow file changes.")
     edits = arguments.get("edits")
     if not isinstance(edits, list) or not edits:
         raise ValueError("apply_patch requires at least one edit.")
@@ -910,7 +949,7 @@ BASE_TOOLS = [
     {"type": "function", "function": {"name": "list_files", "description": "List files below an authorized local directory.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path or path relative to the task code directory."}}, "required": []}}},
     {"type": "function", "function": {"name": "read_file", "description": "Read a UTF-8 text file from an authorized local path.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
 ]
-PATCH_TOOL = {"type": "function", "function": {"name": "apply_patch", "description": "Atomically apply precise text edits. Read files first and supply their SHA-256 content hash as expected_hash. In manual confirmation mode the patch waits for user approval.", "parameters": {"type": "object", "properties": {"edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "expected_hash": {"type": ["string", "null"]}, "old_text": {"type": ["string", "null"]}, "new_text": {"type": "string"}}, "required": ["path", "expected_hash", "old_text", "new_text"]}}}, "required": ["edits"]}}}
+PATCH_TOOL = {"type": "function", "function": {"name": "apply_patch", "description": "Atomically apply precise text edits. For existing files, always use small exact old_text/new_text replacements like a diff; do not replace the whole file. Use old_text=null only to create a brand-new file that does not already exist. Read files first and supply their SHA-256 content hash as expected_hash. In manual confirmation mode the patch waits for user approval.", "parameters": {"type": "object", "properties": {"edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "expected_hash": {"type": ["string", "null"], "description": "SHA-256 hash of the file content read before editing. Required for existing files."}, "old_text": {"type": ["string", "null"], "description": "Existing files: exact text snippet to replace. New files only: null."}, "new_text": {"type": "string", "description": "Replacement text for old_text, or complete content only when creating a new file."}}, "required": ["path", "expected_hash", "old_text", "new_text"]}}}, "required": ["edits"]}}}
 COMMAND_TOOL = {"type": "function", "function": {"name": "run_command", "description": "Start a local command with streamed output. Available only after the user selected full access.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "working_directory": {"type": "string"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800}}, "required": ["command"]}}}
 
 
@@ -927,7 +966,7 @@ def mcp_tool_allowed(task: Task, access_mode: str) -> bool:
     if access_mode == "read-only":
         return True
     if access_mode == "workspace-write":
-        return write_enabled(task)
+        return task_can_write(task)
     return task.permission_mode == "full-access"
 
 
@@ -951,9 +990,10 @@ def task_mcp_tools(db: Session, task: Task) -> list[tuple[TaskMcpTool, McpServer
     return result
 
 
-def tools_for_task(task: Task, db: Session | None = None) -> list[dict[str, Any]]:
+def tools_for_task(task: Task, db: Session | None = None, continuous: bool = False) -> list[dict[str, Any]]:
     """Expose globally configured MCP tools that satisfy the task access policy."""
-    selected_tools = tools_for(task.permission_mode) if write_enabled(task) else list(BASE_TOOLS)
+    can_write = task_can_write(task) if continuous else write_enabled(task)
+    selected_tools = tools_for(task.permission_mode) if can_write else list(BASE_TOOLS)
     if not db:
         return selected_tools
     for server in enabled_mcp_servers(db):
@@ -1021,6 +1061,8 @@ class TaskInput(BaseModel):
     test_command: list[str] = Field(default_factory=lambda: ["python", "-m", "pytest"])
     title: str = Field(min_length=1, max_length=120)
     requirement: str = Field(default="", max_length=10000)
+    permission_mode: str = Field(default="full-access", pattern="^(read-only|workspace-write|full-access)$")
+    execution_mode: Literal["confirm_before_coding", "automatic", "manual_confirmation"] = "automatic"
 
 
 class PermissionInput(BaseModel):
@@ -1311,7 +1353,7 @@ def create_task(payload: TaskInput) -> dict[str, Any]:
         workspace = register_workspace(db, source_root, source_branch, payload.title, payload.test_command)
         record = Task(id=str(uuid.uuid4()), workspace_id=workspace.id, title=payload.title, requirement=payload.requirement,
                       status="awaiting_model", current_stage="需求分析", worktree_path=str(source_root), branch=source_branch,
-                      permission_mode="read-only", execution_mode="confirm_before_coding", artifacts={}, created_at=now(), updated_at=now())
+                      permission_mode=payload.permission_mode, execution_mode=payload.execution_mode, artifacts={}, created_at=now(), updated_at=now())
         db.add(record); db.commit()
         task = dump_task(record)
     return task
@@ -1660,21 +1702,23 @@ def sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def conversation_request(db: Session, task: Task, provider: ModelProvider, history: list[dict[str, str]]) -> tuple[dict[str, Any], dict[str, str]]:
+def conversation_request(db: Session, task: Task, provider: ModelProvider, history: list[dict[str, str]], continuous: bool = False) -> tuple[dict[str, Any], dict[str, str]]:
     permission_descriptions = {
         "read-only": "Read-only: inspect files only inside the task code directory; never modify files or run commands.",
         "workspace-write": "Workspace write: read and modify files only inside the task code directory; do not run commands.",
         "full-access": "Full access: read and modify local files and run local commands when needed.",
     }
     system_message = (
-        f"You are the {task.assigned_agent} in a locally orchestrated coding workflow. Reply in Chinese. "
-        "Use the supplied tools before making claims about repository contents. "
-        "The application displays operational progress separately. Your response is final-answer content only: do not narrate plans, analysis steps, tool use, or future intentions. "
-        "Use clean GitHub-Flavored Markdown for headings, lists, emphasis, and short code identifiers. Do not reveal private chain-of-thought. "
-        "Do not paste changed source code in the final answer; summarize it and rely on changed-file links. "
-        f"Task title: {task.title}; workflow: {task.workflow_type}; stage: {task.current_stage}; code directory: {task.worktree_path or 'not bound'}. "
-        "Complete only the current stage. Do not claim later stages were performed. Reading Agent must not change files; "
-        "Execution Agent may change files only when its provided tools permit it. "
+        "You are the single main coding agent for this task. Reply in Chinese. "
+        "Continuously decide the next useful action from the user goal and tool results: inspect, edit, run verification, "
+        "review, or finish. There are no mandatory workflow stages and no separate agents. "
+        "Use supplied tools before making claims about repository contents. The UI records tool activity separately, so the final "
+        "answer must only report the completed result, verification, and genuine blockers; do not expose chain-of-thought. "
+        "Use concise GitHub-Flavored Markdown and do not paste full changed source files. "
+        f"Task title: {task.title}; task requirement: {task.requirement}; code directory: {task.worktree_path or 'not bound'}. "
+        "When editing existing files, use precise small old_text/new_text replacements; never use old_text=null or whole-file replacement for existing files. "
+        "When a patch requires user approval, wait for its tool result before deciding what to do next. "
+        "Do not commit, grant external path access, or elevate permission without an explicit user action. "
         f"Permission: {permission_descriptions[task.permission_mode]}"
     )
     snapshot = dump_provider(provider)
@@ -1685,7 +1729,7 @@ def conversation_request(db: Session, task: Task, provider: ModelProvider, histo
             *([{"role": "system", "content": f"Compressed earlier conversation:\n{task.context_summary}"}] if task.context_summary else []),
             *history,
         ],
-        "tools": tools_for_task(task, db), "tool_choice": "auto", "stream": True,
+        "tools": tools_for_task(task, db, continuous=continuous), "tool_choice": "auto", "stream": True,
     }, {"Authorization": f"Bearer {read_secrets().get(snapshot['id'], '')}"}
 
 
@@ -1701,7 +1745,7 @@ def view_task_file(task_id: str, path: str = Query(min_length=1)) -> FileRespons
     return FileResponse(target, media_type="text/plain; charset=utf-8")
 
 
-@app.post("/api/tasks/{task_id}/messages/stream")
+@app.post("/api/tasks/{task_id}/legacy-messages/stream")
 def stream_task_message(task_id: str, payload: MessageInput) -> StreamingResponse:
     content = payload.content.strip()
     if not content and not payload.continuation:
@@ -1740,7 +1784,7 @@ def stream_task_message(task_id: str, payload: MessageInput) -> StreamingRespons
                 TaskMessage.context_compacted.is_(False),
             ).order_by(TaskMessage.created_at, TaskMessage.id)
         )]
-        request_body, headers = conversation_request(db, task, provider, history)
+        request_body, headers = conversation_request(db, task, provider, history, continuous=True)
         provider_url = api_root(provider.base_url)
 
     def event_stream():
@@ -1802,9 +1846,12 @@ def stream_task_message(task_id: str, payload: MessageInput) -> StreamingRespons
                             yield sse("activity", {"kind": "tool", "title": "工作阶段", "detail": tool_activity_detail(tool_db, current_task, name)})
                             result = execute_tool(current_task, name, arguments, tool_db)
                         if name == "apply_patch":
-                            for edit in arguments.get("edits", []):
-                                update_agent_run(agent_run_id, task_id, file={"path": edit.get("path", ""), "action": "modified"})
-                                yield sse("file", {"path": edit.get("path", ""), "action": "已更改"})
+                            operation = json.loads(result)
+                            if operation.get("status") == "completed":
+                                for item in (operation.get("result") or {}).get("files", []):
+                                    file_event = {"path": item.get("path", ""), "action": "modified"}
+                                    update_agent_run(agent_run_id, task_id, file=file_event)
+                                    yield sse("file", file_event)
                     except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, subprocess.SubprocessError) as error:
                         result = json.dumps({"error": str(error)})
                         yield sse("activity", {"kind": "error", "title": "工具调用失败", "detail": str(error)})
@@ -1853,6 +1900,151 @@ def stream_task_message(task_id: str, payload: MessageInput) -> StreamingRespons
             yield sse("error", {"message": str(error)})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/tasks/{task_id}/messages/stream")
+def stream_continuous_task_message(task_id: str, payload: MessageInput) -> StreamingResponse:
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(422, "Message cannot be empty")
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        provider = db.scalar(select(ModelProvider).where(ModelProvider.is_active.is_(True)))
+        if not task:
+            raise HTTPException(404, "Task not found")
+        if not provider:
+            raise HTTPException(409, "Configure and activate a model profile first")
+        active = db.scalar(select(AgentRun).where(AgentRun.task_id == task_id, AgentRun.status.in_({"running", "awaiting_approval"})))
+        if active:
+            raise HTTPException(409, "This task already has an active Agent run")
+        db.add(TaskMessage(id=str(uuid.uuid4()), task_id=task_id, role="user", content=content, created_at=now()))
+        task.status, task.current_stage, task.assigned_agent = "in_progress", "continuous_run", "Main Agent"
+        task.workflow_type, task.task_kind, task.routing_decision, task.updated_at = "continuous", "development", None, now()
+        run = AgentRun(id=str(uuid.uuid4()), task_id=task_id, status="running", created_at=now(), updated_at=now())
+        db.add(run); db.commit()
+        history = [{"role": message.role, "content": message.content} for message in db.scalars(
+            select(TaskMessage).where(TaskMessage.task_id == task_id, TaskMessage.context_compacted.is_(False)).order_by(TaskMessage.created_at, TaskMessage.id)
+        )]
+        request_body, headers = conversation_request(db, task, provider, history, continuous=True)
+        provider_url, run_id = api_root(provider.base_url), run.id
+
+    def event_stream():
+        def wait_for_operation(operation_id: str):
+            announced = False
+            while True:
+                with SessionLocal() as operation_db:
+                    operation = operation_db.get(ExecutionOperation, operation_id)
+                    if not operation:
+                        return {"error": "Operation no longer exists"}
+                    snapshot = operation_payload(operation)
+                    if operation.status not in {"queued", "running", "pending_approval"}:
+                        return snapshot
+                    if operation.status == "pending_approval" and not announced:
+                        announced = True
+                        update_agent_run(run_id, task_id, status="awaiting_approval", activity={"kind": "pause", "title": "等待补丁确认", "detail": "确认后会自动继续"})
+                        save_agent_run_context(run_id, task_id, request_body["messages"], operation_id)
+                        yield sse("pause", {"operation_id": operation_id, "reason": "approval_required"})
+                time.sleep(0.2)
+
+        try:
+            yield sse("run", {"id": run_id, "status": "running"})
+            update_agent_run(run_id, task_id, activity={"kind": "agent", "title": "Main Agent", "detail": "连续执行任务"})
+            yield sse("activity", {"kind": "agent", "title": "Main Agent", "detail": "连续执行任务"})
+            for _ in range(12):
+                answer = ""
+                calls: dict[int, dict[str, Any]] = {}
+                with httpx.stream("POST", f"{provider_url}/chat/completions", json=request_body, headers=headers, timeout=120) as response:
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line.removeprefix("data:").strip()
+                        if data == "[DONE]":
+                            continue
+                        choices = (json.loads(data).get("choices") or [])
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
+                        text = delta.get("content")
+                        if text:
+                            answer += text; update_agent_run(run_id, task_id, token=text); yield sse("token", {"content": text})
+                        for call in delta.get("tool_calls", []):
+                            index = call.get("index", 0)
+                            stored = calls.setdefault(index, {"id": call.get("id"), "function": {"name": "", "arguments": ""}})
+                            stored["id"] = call.get("id") or stored["id"]
+                            function = call.get("function", {})
+                            stored["function"]["name"] += function.get("name", "")
+                            stored["function"]["arguments"] += function.get("arguments", "")
+                if not calls:
+                    if not answer.strip():
+                        raise ValueError("The model returned an empty response")
+                    with SessionLocal() as db:
+                        task = db.get(Task, task_id); task.status, task.current_stage = "completed", COMPLETED_STAGE
+                        message = TaskMessage(id=str(uuid.uuid4()), task_id=task_id, role="assistant", content=answer, created_at=now())
+                        db.add(message); stored = db.get(AgentRun, run_id)
+                        stored.status, stored.result, stored.updated_at = "completed", {**(stored.result or {}), "content": answer, "conversation": request_body["messages"]}, now()
+                        db.commit()
+                    yield sse("done", {"message": dump_message(message)})
+                    return
+                tool_calls = [calls[index] for index in sorted(calls)]
+                request_body["messages"].append({"role": "assistant", "content": None, "tool_calls": tool_calls})
+                for call in tool_calls:
+                    name = call["function"]["name"]
+                    try:
+                        arguments = json.loads(call["function"]["arguments"] or "{}")
+                        yield sse("tool_call", {"name": name, "arguments": arguments})
+                        with SessionLocal() as db:
+                            current_task = db.get(Task, task_id)
+                            activity = {"kind": "tool", "title": name, "detail": tool_activity_detail(db, current_task, name)}
+                            update_agent_run(run_id, task_id, activity=activity)
+                            yield sse("activity", activity)
+                            result = execute_tool(current_task, name, arguments, db)
+                        if name in {"apply_patch", "run_command"}:
+                            operation = json.loads(result)
+                            if operation["status"] in {"queued", "running", "pending_approval"}:
+                                result = json.dumps((yield from wait_for_operation(operation["id"])), ensure_ascii=False)
+                                update_agent_run(run_id, task_id, status="running")
+                                operation = json.loads(result)
+                        if name == "apply_patch":
+                            if operation.get("status") == "completed":
+                                for item in (operation.get("result") or {}).get("files", []):
+                                    file_event = {"path": item.get("path", ""), "action": "modified"}
+                                    update_agent_run(run_id, task_id, file=file_event)
+                                    yield sse("file", file_event)
+                    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+                        result = json.dumps({"error": str(error)}, ensure_ascii=False)
+                        yield sse("activity", {"kind": "error", "title": "tool failed", "detail": str(error)})
+                    request_body["messages"].append({"role": "tool", "tool_call_id": call["id"], "content": result})
+                    save_agent_run_context(run_id, task_id, request_body["messages"])
+            raise ValueError("The model exceeded the local tool-call limit")
+        except Exception as error:
+            update_agent_run(run_id, task_id, error=str(error), status="failed")
+            with SessionLocal() as db:
+                failed_task = db.get(Task, task_id)
+                if failed_task:
+                    failed_task.status, failed_task.updated_at = "failed", now()
+                    db.commit()
+            yield sse("error", {"message": str(error)})
+
+    event_queue: queue.Queue[str | None] = queue.Queue()
+
+    def run_in_background() -> None:
+        try:
+            for event in event_stream():
+                event_queue.put(event)
+        finally:
+            event_queue.put(None)
+
+    threading.Thread(target=run_in_background, daemon=True).start()
+
+    def subscribe() -> Any:
+        while True:
+            event = event_queue.get()
+            if event is None:
+                return
+            yield event
+
+    return StreamingResponse(subscribe(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/tasks/{task_id}/messages", status_code=201)

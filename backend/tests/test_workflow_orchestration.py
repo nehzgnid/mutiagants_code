@@ -73,7 +73,10 @@ def test_master_agent_uses_full_route_and_requires_confirmation_before_coding(tm
     repo = tmp_path / "full-workflow"
     init_clean_repo(repo)
     try:
-        task = client.post("/api/tasks", json={"source_type": "local", "local_path": str(repo), "title": "复杂修改"}).json()
+        task = client.post("/api/tasks", json={
+            "source_type": "local", "local_path": str(repo), "title": "复杂修改",
+            "permission_mode": "read-only", "execution_mode": "confirm_before_coding",
+        }).json()
         with SessionLocal() as db:
             record = db.get(main.Task, task["id"])
             assert record.execution_mode == "confirm_before_coding"

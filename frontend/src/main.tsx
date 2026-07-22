@@ -122,6 +122,12 @@ type ExecutionOperation = {
 };
 const INITIAL_RENDERED_MESSAGES = 20;
 
+function dedupeChangedFiles(files: ChangedFile[]): ChangedFile[] {
+  return files.filter((file, index, items) =>
+    items.findIndex((candidate) => candidate.path === file.path && candidate.action === file.action) === index
+  );
+}
+
 function restoreAgentRuns(agentRuns: AgentRun[]): Run[] {
   return agentRuns
     .filter((run) => run.status !== "completed" || (run.result.stages?.length ?? 0) > 0)
@@ -132,7 +138,7 @@ function restoreAgentRuns(agentRuns: AgentRun[]): Run[] {
       title: run.status === "failed" ? "Agent 运行失败" : "Agent 正在工作",
       content: run.result.content ?? "",
       activities: run.result.activities ?? [],
-      files: run.result.files ?? [],
+      files: dedupeChangedFiles(run.result.files ?? []),
       complete: run.status !== "running",
       workflow: run.result.workflow,
       activeAgent: [...(run.result.activities ?? [])].reverse().find((activity) => activity.kind === "agent")?.title,
@@ -471,8 +477,8 @@ function App() {
         id: runId,
         created_at: new Date().toISOString(),
         content: "",
-        activities: [{ kind: "agent", title: "主 Agent", detail: "正在判定任务复杂度和协作流程" }],
-        activeAgent: "主 Agent",
+        activities: [{ kind: "agent", title: "Main Agent", detail: "正在启动连续执行任务" }],
+        activeAgent: "Main Agent",
         stages: [],
         files: [],
         complete: false,
@@ -502,18 +508,6 @@ function App() {
           const data = chunk.match(/^data: (.+)$/m)?.[1];
           if (!eventName || !data) continue;
           const payload = JSON.parse(data);
-          if (eventName === "workflow")
-            updateRun(runId, (run) => ({ ...run, workflow: payload }));
-          if (eventName === "stage")
-            updateRun(runId, (run) => ({
-              ...run,
-              activeAgent: payload.status === "running" ? payload.agent : undefined,
-              stages: payload.status === "running"
-                ? [...run.stages, { stage: payload.stage, agent: payload.agent, status: "running" }]
-                : run.stages.map((stage) => stage.stage === payload.stage && stage.status === "running"
-                  ? { ...stage, status: "completed", output: payload.output }
-                  : stage),
-            }));
           if (eventName === "activity")
             updateRun(runId, (run) => ({
               ...run,
@@ -528,7 +522,7 @@ function App() {
           if (eventName === "file")
             updateRun(runId, (run) => ({
               ...run,
-              files: [...run.files, payload],
+              files: dedupeChangedFiles([...run.files, payload]),
             }));
           if (eventName === "done") {
             updateRun(runId, (run) => ({
@@ -1039,7 +1033,8 @@ function RunOutput({ run, taskId, onRetry }: { run: Run; taskId: string; onRetry
       <CircleDot size={14} />
     );
   return (
-    <article className="message assistant streamed">
+    <article className={`message assistant streamed ${!run.complete ? "working" : ""}`}>
+      {!run.complete && <span className="agent-working-spinner" aria-label="Agent 正在工作" />}
       <details className="activity-trace" open={!run.complete}>
         <summary>
           <Activity size={15} /> {run.complete ? (run.title ?? "工作过程") : (run.title ?? "Agent 正在工作")}
@@ -1225,6 +1220,8 @@ function TaskModal({
     [githubUrl, setGithubUrl] = useState(""),
     [clonePath, setClonePath] = useState(""),
     [title, setTitle] = useState(""),
+    [permissionMode, setPermissionMode] = useState<PermissionMode>("full-access"),
+    [executionMode, setExecutionMode] = useState<ExecutionMode>("automatic"),
     [error, setError] = useState("");
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -1238,6 +1235,8 @@ function TaskModal({
             github_url: sourceType === "github" ? githubUrl : undefined,
             clone_path: sourceType === "github" ? clonePath : undefined,
             title,
+            permission_mode: permissionMode,
+            execution_mode: executionMode,
             test_command: ["python", "-m", "pytest"],
           }),
         }),
@@ -1308,6 +1307,22 @@ function TaskModal({
             value={title}
             onChange={(event) => setTitle(event.target.value)}
           />
+        </label>
+        <label>
+          Agent 权限
+          <select value={permissionMode} onChange={(event) => setPermissionMode(event.target.value as PermissionMode)}>
+            <option value="full-access">完全访问：可修改任务目录并运行本地命令</option>
+            <option value="workspace-write">工作区读写：可修改任务目录，不运行命令</option>
+            <option value="read-only">只读：只查看文件</option>
+          </select>
+        </label>
+        <label>
+          执行模式
+          <select value={executionMode} onChange={(event) => setExecutionMode(event.target.value as ExecutionMode)}>
+            <option value="automatic">自动执行：连续读取、修改、验证</option>
+            <option value="manual_confirmation">手动确认补丁：每组修改先预览</option>
+            <option value="confirm_before_coding">旧式编码前确认</option>
+          </select>
         </label>
         {error && <p className="error">{error}</p>}
         <div className="modal-actions">

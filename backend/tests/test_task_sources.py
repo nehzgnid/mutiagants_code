@@ -44,6 +44,8 @@ def test_create_task_from_local_source_binds_directory(tmp_path: Path) -> None:
         assert response.status_code == 201
         body = response.json()
         assert body["title"].startswith("local-task-")
+        assert body["permission_mode"] == "full-access"
+        assert body["execution_mode"] == "automatic"
         with SessionLocal() as db:
             workspace = db.scalar(select(Workspace).where(Workspace.path == str(repo.resolve())))
             assert workspace is not None
@@ -98,16 +100,17 @@ def test_workspace_management_and_existing_source_are_not_public(tmp_path: Path)
         remove_workspace_by_path(repo)
 
 
-def test_task_starts_read_only_and_permission_changes_in_conversation(tmp_path: Path) -> None:
+def test_task_creation_accepts_permission_and_permission_changes_in_conversation(tmp_path: Path) -> None:
     repo = tmp_path / "permission-repo"
     init_clean_repo(repo)
     try:
         response = client.post("/api/tasks", json={
             "source_type": "local", "local_path": str(repo), "title": f"permission-{uuid.uuid4().hex}",
+            "permission_mode": "workspace-write", "execution_mode": "manual_confirmation",
         })
         assert response.status_code == 201
-        assert response.json()["permission_mode"] == "read-only"
-        assert response.json()["execution_mode"] == "confirm_before_coding"
+        assert response.json()["permission_mode"] == "workspace-write"
+        assert response.json()["execution_mode"] == "manual_confirmation"
         update = client.patch(f"/api/tasks/{response.json()['id']}/permission", json={"permission_mode": "workspace-write"})
         assert update.status_code == 200
         assert update.json()["permission_mode"] == "workspace-write"

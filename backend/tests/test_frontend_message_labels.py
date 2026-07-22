@@ -87,3 +87,34 @@ def test_failed_agent_runs_are_restored_after_a_refresh() -> None:
     assert "function restoreAgentRuns" in source
     assert 'api<AgentRun[]>(`/api/tasks/${selected.id}/agent-runs`)' in source
     assert '.filter((run) => run.status !== "completed" || (run.result.stages?.length ?? 0) > 0)' in source
+
+
+def test_running_agent_run_shows_a_spinner_before_the_agent_bubble() -> None:
+    source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+    styles = (Path(__file__).parents[2] / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
+
+    assert '`message assistant streamed ${!run.complete ? "working" : ""}`' in source
+    assert 'className="agent-working-spinner"' in source
+    assert ".agent-working-spinner" in styles
+    assert "margin-left: -44px" in styles
+    assert "padding: 16px 2px 28px 46px" in styles
+    assert ".message.assistant.working { position: relative; }" in styles
+    assert "left: -39px" in styles
+    assert "conic-gradient" in styles
+    assert "animation: agent-spin .75s linear infinite" in styles
+
+
+def test_continuous_run_uses_main_agent_startup_copy() -> None:
+    source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+
+    assert 'title: "Main Agent", detail: "正在启动连续执行任务"' in source
+    assert 'activeAgent: "Main Agent"' in source
+    assert "正在判定任务复杂度和协作流程" not in source
+
+
+def test_changed_files_are_deduplicated_for_streaming_and_restored_runs() -> None:
+    source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+
+    assert "function dedupeChangedFiles(files: ChangedFile[]): ChangedFile[]" in source
+    assert "files: dedupeChangedFiles(run.result.files ?? [])" in source
+    assert "files: dedupeChangedFiles([...run.files, payload])" in source

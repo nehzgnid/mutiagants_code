@@ -180,17 +180,23 @@ def test_streamed_conversation_emits_activity_tokens_and_completion(monkeypatch,
                 "data: [DONE]",
             ])
 
+    captured_stream_requests: list[dict] = []
     monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: RoutingResponse())
-    monkeypatch.setattr(main.httpx, "stream", lambda *args, **kwargs: StreamResponse())
+    monkeypatch.setattr(main.httpx, "stream", lambda *args, **kwargs: (captured_stream_requests.append(kwargs["json"]) or StreamResponse()))
     task = client.post("/api/tasks", json={"source_type": "local", "local_path": str(repo), "title": f"stream-{uuid.uuid4().hex}"}).json()
     try:
         response = client.post(f"/api/tasks/{task['id']}/messages/stream", json={"content": "stream this"})
         assert response.status_code == 200
-        assert "event: workflow" in response.text
+        assert "event: run" in response.text
         assert "event: activity" in response.text
         assert "event: token" in response.text
         assert "streamed answer" in response.text
         assert "event: done" in response.text
+        tool_names = {tool["function"]["name"] for tool in captured_stream_requests[-1]["tools"]}
+        assert {"list_files", "read_file", "apply_patch", "run_command"}.issubset(tool_names)
+        patch_tool = next(tool["function"] for tool in captured_stream_requests[-1]["tools"] if tool["function"]["name"] == "apply_patch")
+        assert "do not replace the whole file" in patch_tool["description"]
+        assert "old_text=null only to create a brand-new file" in patch_tool["description"]
 
         class ToolResponse:
             def __init__(self, lines: list[str]): self.lines = lines
@@ -213,6 +219,8 @@ def test_streamed_conversation_emits_activity_tokens_and_completion(monkeypatch,
         tool_reply = client.post(f"/api/tasks/{task['id']}/messages/stream", json={"content": "list files"})
         assert tool_reply.status_code == 200
         assert "list_files" in tool_reply.text
+        assert "event: activity" in tool_reply.text
+        assert "正在执行 list_files" in tool_reply.text
         assert "tool result" in tool_reply.text
         assert "event: done" in tool_reply.text
 
@@ -227,8 +235,7 @@ def test_streamed_conversation_emits_activity_tokens_and_completion(monkeypatch,
         assert failed.status_code == 200
         assert "event: error" in failed.text
         assert "connection refused" in failed.text
-        assert "after 5 retries" in failed.text
-        assert delays == [2, 4, 8, 16, 32]
+        assert delays == []
         agent_runs = client.get(f"/api/tasks/{task['id']}/agent-runs").json()
         failed_run = next(run for run in agent_runs if run["status"] == "failed")
         assert failed_run["result"]["error"]
@@ -240,7 +247,7 @@ def test_streamed_conversation_emits_activity_tokens_and_completion(monkeypatch,
         remove_workspace_by_path(repo)
 
 
-def test_automatic_continuation_runs_only_the_next_planned_stage(monkeypatch, tmp_path: Path) -> None:
+def test_continuous_run_completes_without_creating_stage_records(monkeypatch, tmp_path: Path) -> None:
     repo = tmp_path / "automatic-continuation-repo"
     init_clean_repo(repo)
     original_provider_id = active_provider_id()
@@ -271,13 +278,14 @@ def test_automatic_continuation_runs_only_the_next_planned_stage(monkeypatch, tm
         assert client.patch(f"/api/tasks/{task['id']}/execution-mode", json={"execution_mode": "automatic"}).status_code == 200
         assert client.post(f"/api/tasks/{task['id']}/messages/stream", json={"content": "implement this"}).status_code == 200
         current = client.get(f"/api/tasks/{task['id']}").json()
-        assert current["current_stage"] == main.AWAIT_ACCEPTANCE_STAGE
+        assert current["current_stage"] == main.COMPLETED_STAGE
         history = client.get(f"/api/tasks/{task['id']}/messages").json()
         assert [message["role"] for message in history] == ["user", "assistant"]
         stages = client.get(f"/api/tasks/{task['id']}/stages").json()
-        assert [stage["stage"] for stage in stages] == [main.REQUIREMENTS_STAGE, main.HIGH_LEVEL_DESIGN_STAGE]
+        assert stages == []
         agent_run = client.get(f"/api/tasks/{task['id']}/agent-runs").json()[0]
-        assert [stage["stage"] for stage in agent_run["result"]["stages"]] == [main.REQUIREMENTS_STAGE, main.HIGH_LEVEL_DESIGN_STAGE]
+        assert agent_run["status"] == "completed"
+        assert agent_run["result"]["content"] == "stage complete"
     finally:
         remove_provider(provider["id"])
         if original_provider_id:

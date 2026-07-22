@@ -52,6 +52,35 @@ def test_patch_is_atomic_and_can_be_undone(tmp_path: Path) -> None:
         remove_workspace_by_path(repo)
 
 
+def test_patch_rejects_whole_file_replace_for_existing_file(tmp_path: Path) -> None:
+    task, repo = writable_task(tmp_path)
+    try:
+        response = client.post(f"/api/tasks/{task['id']}/patches", json={"edits": [{
+            "path": "sample.txt", "expected_hash": digest("before\n"), "old_text": None, "new_text": "whole file\n",
+        }]})
+        assert response.status_code == 201
+        operation = response.json()
+        assert operation["status"] == "failed"
+        assert "old_text/new_text edits" in operation["result"]["message"]
+        assert repo.joinpath("sample.txt").read_text(encoding="utf-8") == "before\n"
+    finally:
+        remove_workspace_by_path(repo)
+
+
+def test_patch_can_create_new_file_with_null_old_text(tmp_path: Path) -> None:
+    task, repo = writable_task(tmp_path)
+    try:
+        response = client.post(f"/api/tasks/{task['id']}/patches", json={"edits": [{
+            "path": "created.txt", "expected_hash": None, "old_text": None, "new_text": "new file\n",
+        }]})
+        assert response.status_code == 201
+        operation = response.json()
+        assert operation["status"] == "completed"
+        assert repo.joinpath("created.txt").read_text(encoding="utf-8") == "new file\n"
+    finally:
+        remove_workspace_by_path(repo)
+
+
 def test_manual_patch_detects_concurrent_file_change(tmp_path: Path) -> None:
     task, repo = writable_task(tmp_path, "manual_confirmation")
     try:

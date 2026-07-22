@@ -2011,3 +2011,297 @@ Verification: reviewed `backend/app/main.py` cleanup and tool exposure flow.
 - Ran focused MCP cleanup, automatic workflow, and frontend single-stream contract tests.
 
 Verification: `npm --prefix frontend run build` and `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_mcp_stdio.py backend\\tests\\test_task_conversation.py backend\\tests\\test_frontend_conversation_viewport.py -q` passed with 14 tests; `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` and `git diff --check` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: the previous chat endpoint made a routing model call and advanced a fixed stage list before the coding Agent could act, so tool results could not determine the next action.
+- High-level design: make one durable main-Agent run own the conversation and tool loop; retain legacy stage records only for historical reads.
+- Detailed design: persist tool conversation state on `AgentRun`, use permission-based tools for continuous runs, wait for command or patch outcomes before the next model call, and detach SSE subscription from the background run.
+
+Verification: reviewed routing, tool dispatch, operation approval, AgentRun persistence, and conversation rendering.
+
+### Code
+
+- Replaced the normal message-stream execution path with a continuous Main Agent loop that does not create `StageRun` records or call the master routing model.
+- Added persisted tool conversation state, background run execution, restart failure recovery, run/activity/tool/pause SSE events, command-result waiting, and approval-gated patch continuation within the same model context.
+- Kept legacy stage helpers and data readable, while separating their stage-based write gate from the permission-only continuous-run tool gate.
+- Removed frontend handling of workflow and stage events for newly streamed runs.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 53 tests; `npm --prefix frontend run build`, `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py`, and `git diff --check` passed.
+
+### Code Review
+
+- Confirmed a new run has no route decision or `StageRun`, only one active run is allowed per task, and tool results are appended before the next model request.
+- Confirmed command and manually approved patch operations wait for terminal status, while existing patch hashing, undo, external-path authorization, and Git confirmation APIs remain unchanged.
+
+Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, and changed tests.
+
+### Unit Testing
+
+- Updated streamed-conversation coverage to require a continuous-run event and no stage records; retained tool-loop and failed-run persistence coverage.
+- Ran the full backend suite and frontend type/build validation.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 53 tests and one existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
+
+## 2026-07-22
+
+### Configuration
+
+- Requirements analysis: the frontend development server still proxied `/api` to port `8787`, while the restarted continuous-run backend was available on port `8789`, causing new stream endpoints to fall through to the stale API fallback.
+- High-level design: keep the existing relative frontend API calls and point the Vite development proxy at the active backend port.
+- Detailed design: update `frontend/vite.config.ts` and the matching frontend proxy contract test from `8787` to `8789`.
+
+Verification: inspected the running listener ports, `/api/health`, and the registered OpenAPI routes before changing the proxy.
+
+### Code Review
+
+- Confirmed the change is limited to the development proxy target and its test assertion; no API paths or runtime message flow were changed.
+
+Verification: static review of the two-line configuration/test change.
+
+### Unit Testing
+
+- Ran the focused proxy contract test, frontend build, and diff whitespace checks.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_dev_proxy.py -q`, `npm --prefix frontend run build`, and `git diff --check` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: newly created local code tasks still defaulted to read-only and confirm-before-coding, so the continuous Main Agent only received `list_files` and `read_file` and correctly reported that it could not modify files or run commands.
+- High-level design: keep the existing permission modes, but make new code tasks start with Codex-like execution defaults while still allowing the user to choose a stricter permission or confirmation mode at creation time.
+- Detailed design: add `permission_mode` and `execution_mode` to task creation input, persist those values instead of hardcoded read-only defaults, and have the task modal send `full-access` plus `automatic` by default with explicit selectors.
+
+Verification: inspected the continuous-run tool selection path, task creation endpoint, and task modal payload before changing source.
+
+### Code
+
+- Updated backend task creation to accept and persist the requested permission and execution mode, defaulting new tasks to `full-access` and `automatic`.
+- Updated the frontend task modal to send those values and expose creation-time selectors for permission and execution mode.
+- Updated task-source regression tests to cover the new defaults and explicit creation-time permission/mode overrides.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_sources.py backend\\tests\\test_task_conversation.py -q`, `npm --prefix frontend run build`, and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` passed.
+
+### Code Review
+
+- Confirmed the change is limited to task creation defaults and payload plumbing; existing permission switch APIs, patch approval, command gating, and historical read-only tasks remain unchanged.
+- Confirmed `full-access` is still a permission value recorded on the task, so users can downgrade tasks to workspace-write or read-only before sending work.
+
+Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, and updated task tests.
+
+### Unit Testing
+
+- Ran focused backend tests for task creation and continuous conversation behavior, frontend type/build validation, and backend Python compilation.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_sources.py backend\\tests\\test_task_conversation.py -q` passed with 11 tests and one existing Starlette deprecation warning; `npm --prefix frontend run build` and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` passed.
+
+## 2026-07-22
+
+### Code
+
+- Requirements analysis: legacy workflow orchestration tests still implicitly depended on the removed read-only and confirm-before-coding task defaults.
+- High-level design: keep legacy-stage coverage by making those compatibility tests request their required permission and execution mode explicitly.
+- Detailed design: updated the legacy full-route test fixture to create a read-only, confirm-before-coding task so the assertions continue to verify the old pause behavior instead of the new task defaults.
+
+Verification: reviewed the failing assertion and the legacy `route_message` permission gate.
+
+### Code Review
+
+- Confirmed the test change does not alter production behavior and only makes the compatibility scenario explicit.
+
+Verification: static review of `backend/tests/test_workflow_orchestration.py`.
+
+### Unit Testing
+
+- Re-ran the full backend suite, frontend build, and diff whitespace checks after the test update.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 53 tests and one existing Starlette deprecation warning; `npm --prefix frontend run build` and `git diff --check` passed.
+
+## 2026-07-22
+
+### Code
+
+- Requirements analysis: full-access continuous tasks still produced read-only model requests because the new `/messages/stream` endpoint called the shared request builder without the continuous-run tool gate.
+- High-level design: keep legacy stage tool gating for legacy endpoints, but make the continuous stream always use permission-only tool selection.
+- Detailed design: pass `continuous=True` when building the model request for `/api/tasks/{task_id}/messages/stream`, and add a streamed-conversation regression assertion that full-access continuous runs expose `apply_patch` and `run_command`.
+
+Verification: inspected the persisted task `93fd8890-b82a-406d-9f0c-1942f3e81c87`, confirmed it was `full-access + automatic`, and reproduced that `tools_for_task(..., continuous=False)` returned only read tools while `continuous=True` returned patch and command tools.
+
+### Code Review
+
+- Confirmed the fix is limited to the continuous endpoint and does not broaden legacy staged workflow permissions.
+- Confirmed `run_command` remains gated by `full-access`, while `apply_patch` remains gated by workspace-write or full-access and the existing patch approval mode.
+
+Verification: static review of `backend/app/main.py` and the updated stream test.
+
+### Unit Testing
+
+- Ran focused conversation/task-source tests, frontend build, and backend Python compilation.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py backend\\tests\\test_task_sources.py -q` passed with 11 tests and one existing Starlette deprecation warning; `npm --prefix frontend run build` and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` passed.
+
+## 2026-07-22
+
+### Code
+
+- Requirements analysis: while the Agent is executing, the conversation pane only shows an expandable work record and does not provide an immediate visual busy indicator directly beside the Agent bubble.
+- High-level design: render a lightweight spinner only for incomplete Agent run messages, so completed history stays visually stable.
+- Detailed design: add a `working` class and `agent-working-spinner` element to `RunOutput` when `run.complete` is false, and position the spinner just before the assistant bubble with a CSS rotation animation.
+
+Verification: inspected the message timeline and `RunOutput` rendering path before changing the UI.
+
+### Code Review
+
+- Confirmed the spinner is tied to `!run.complete`, so it disappears on `done` or `error` when the run is marked complete.
+- Confirmed the change is limited to the Agent run bubble and does not alter stream handling, backend APIs, or persisted messages.
+
+Verification: static review of `frontend/src/main.tsx`, `frontend/src/styles.css`, and the frontend label regression test.
+
+### Unit Testing
+
+- Added a regression test for the running-Agent spinner markup and animation style.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_message_labels.py -q`, `npm --prefix frontend run build`, and `git diff --check` passed.
+
+## 2026-07-22
+
+### Code
+
+- Requirements analysis: allowing hash-guarded whole-file replacement still encouraged the model to retry large file rewrites instead of using precise diff-style edits for existing files.
+- High-level design: make `apply_patch` a local-diff tool for existing files; reserve `old_text=null` only for creating brand-new files.
+- Detailed design: reject `old_text=null` whenever the target file already exists, even with a matching hash; return that policy rejection as a failed patch operation; update the tool description and main Agent system prompt to require small exact `old_text/new_text` replacements and to forbid whole-file replacement for existing files.
+
+Verification: inspected the active run for task `93fd8890-b82a-406d-9f0c-1942f3e81c87` and confirmed the model was still attempting existing-file replacement through `old_text=null`.
+
+### Code Review
+
+- Confirmed existing-file edits must now go through snippet replacement, preserving atomic hash/text checks.
+- Confirmed new-file creation can still use `old_text=null` when the file does not exist.
+- Confirmed the model-facing tool contract now states the same rule enforced by the backend.
+
+Verification: static review of `backend/app/main.py` and updated tests.
+
+### Unit Testing
+
+- Updated patch operation tests to reject whole-file replacement for existing files and retain new-file creation coverage.
+- Added a streamed conversation assertion that the model receives the no-whole-file-replacement apply_patch description.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_execution_operations.py backend\\tests\\test_task_conversation.py -q`, `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q`, `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py`, `npm --prefix frontend run build`, and `git diff --check` passed.
+
+## 2026-07-22
+
+### Code
+
+- Requirements analysis: continuous runs could loop on `File already exists` when the model used `old_text: null` to replace an already-read existing file, and repeated patch attempts made the same changed file appear many times in the UI.
+- High-level design: support safe whole-file replacement only when the model supplies a matching `expected_hash`, and deduplicate changed-file records in both persisted runs and live stream state.
+- Detailed design: allow `patch_preview` to replace existing files with `old_text: null` after the existing hash check passes; keep rejecting existing-file replacement without `expected_hash`; emit file events only from completed patch operation results; deduplicate AgentRun files by path/action; deduplicate frontend restored and live changed-file lists.
+
+Verification: inspected the failed task `93fd8890-b82a-406d-9f0c-1942f3e81c87`, recent patch operations, and the continuous stream file-event path.
+
+### Code Review
+
+- Confirmed whole-file replacement still requires the same hash guard used by ordinary text patches, so stale model context cannot overwrite concurrent edits silently.
+- Confirmed conflict and failed patch attempts no longer add changed-file links.
+- Confirmed frontend de-duplication is presentation-safe and does not change operation history.
+
+Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, and updated regression tests.
+
+### Unit Testing
+
+- Added coverage for hash-guarded whole-file replacement and changed-file de-duplication.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_execution_operations.py backend\\tests\\test_frontend_message_labels.py backend\\tests\\test_task_conversation.py -q`, `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q`, `npm --prefix frontend run build`, `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py`, and `git diff --check` passed.
+
+## 2026-07-22
+
+### Code
+
+- Requirements analysis: after restoring the Agent bubble to its original alignment, the spinner used a negative left offset and was clipped by the `.message-list` scroll container.
+- High-level design: keep the bubble at its original visual x-coordinate while extending the scroll container left enough for the external spinner to remain visible.
+- Detailed design: move the message list 44px left and add compensating 46px left padding, preserving message alignment while making the spinner's `left: -39px` area visible.
+
+Verification: inspected the message-list overflow boundary and spinner positioning.
+
+### Code Review
+
+- Confirmed the message bubble alignment is preserved by the negative margin plus compensating padding pair.
+- Confirmed the spinner remains outside the Agent bubble and is no longer clipped by the scroll container.
+
+Verification: static review of `frontend/src/styles.css` and the updated frontend regression assertion.
+
+### Unit Testing
+
+- Updated the frontend spinner regression test to require the message-list left extension and compensating padding.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_message_labels.py -q`, `npm --prefix frontend run build`, and `git diff --check` passed.
+
+## 2026-07-22
+
+### Code
+
+- Requirements analysis: the running Agent card still showed the old complexity-routing copy while the backend now uses the continuous Main Agent loop, and tool calls were not streamed as visible activity updates.
+- High-level design: keep the existing compact activity-list style and expose real continuous-run progress through the same `activity` event shape already used by the card.
+- Detailed design: change the frontend startup activity to `Main Agent / 正在启动连续执行任务`; when the backend executes a tool call, reuse `tool_activity_detail` to persist and stream a matching `tool` activity event.
+
+Verification: reviewed the continuous message stream, running-card event handling, and existing activity copy.
+
+### Code Review
+
+- Confirmed the change does not introduce a new workflow stage model and keeps the visible text in the existing short activity style.
+- Confirmed tool activity persistence and live streaming now use the same payload, so refreshed and active runs stay consistent.
+
+Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, and focused regression assertions.
+
+### Unit Testing
+
+- Added regression coverage for the continuous-run startup copy and streamed tool activity visibility.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_message_labels.py backend\\tests\\test_task_conversation.py -q`, `npm --prefix frontend run build`, and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` passed.
+
+## 2026-07-22
+
+### Code
+
+- Requirements analysis: the loading ring was placed outside the Agent bubble, but the running bubble itself was shifted right, so it no longer aligned with normal Agent messages.
+- High-level design: keep the spinner outside the bubble while restoring the Agent bubble to its original message alignment.
+- Detailed design: remove the running-message left margin and max-width reduction, retaining relative positioning on the bubble and the spinner's negative left offset.
+
+Verification: inspected the running Agent bubble CSS and spinner offset.
+
+### Code Review
+
+- Confirmed the spinner remains outside the conversation content area and the bubble alignment now matches completed Agent messages.
+
+Verification: static review of `frontend/src/styles.css` and the updated regression assertion.
+
+### Unit Testing
+
+- Updated the frontend spinner regression test to require the bubble's original relative positioning plus the spinner's external left offset.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_message_labels.py -q`, `npm --prefix frontend run build`, and `git diff --check` passed.
+
+## 2026-07-22
+
+### Code
+
+- Requirements analysis: the initial busy indicator was too small and positioned like an inline status dot, so it did not read as a loading UI outside the Agent bubble.
+- High-level design: reserve a dedicated lane to the left of the running Agent bubble and render a larger animated loading ring there.
+- Detailed design: move incomplete Agent run bubbles right by 46px, place the spinner in the reserved left lane, and replace the border spinner with a conic-gradient ring plus inner cutout for a clearer loading animation.
+
+Verification: reviewed the prior `RunOutput` markup and spinner CSS placement.
+
+### Code Review
+
+- Confirmed the loading ring remains conditional on `!run.complete` and still disappears when the run finishes or errors.
+- Confirmed the new margin prevents the spinner from overlapping the Agent response content.
+
+Verification: static review of `frontend/src/styles.css` and the updated frontend regression test.
+
+### Unit Testing
+
+- Updated the frontend message-label regression test to require the external lane, conic-gradient ring, and faster loading animation.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_message_labels.py -q`, `npm --prefix frontend run build`, and `git diff --check` passed.
