@@ -1180,16 +1180,18 @@ function McpServerModal({
   onChanged: () => void;
 }) {
   const [editing, setEditing] = useState<McpServer | null>(null);
+  const [showCustomForm, setShowCustomForm] = useState(false);
   const [name, setName] = useState("");
   const [command, setCommand] = useState("");
   const [argumentsText, setArgumentsText] = useState("[]");
   const [enabled, setEnabled] = useState(true);
   const [message, setMessage] = useState("");
-  const reset = () => {
-    setEditing(null); setName(""); setCommand(""); setArgumentsText("[]"); setEnabled(true); setMessage("");
+  const reset = (clearMessage = true) => {
+    setEditing(null); setShowCustomForm(false); setName(""); setCommand(""); setArgumentsText("[]"); setEnabled(true);
+    if (clearMessage) setMessage("");
   };
   const edit = (server: McpServer) => {
-    setEditing(server); setName(server.name); setCommand(server.command);
+    setEditing(server); setShowCustomForm(true); setName(server.name); setCommand(server.command);
     setArgumentsText(JSON.stringify(server.arguments, null, 2)); setEnabled(server.enabled); setMessage("");
   };
   const submit = async (event: FormEvent) => {
@@ -1204,7 +1206,7 @@ function McpServerModal({
       });
       setMessage(`已发现 ${server.tools.length} 个工具。`);
       onChanged();
-      if (!editing) reset();
+      reset(false);
     } catch (error) {
       setMessage(String(error).replace(/^Error: /, ""));
     }
@@ -1233,8 +1235,8 @@ function McpServerModal({
       <section className="modal mcp-modal">
         <div className="modal-heading"><h2>本地 MCP Server</h2><button title="关闭" onClick={onClose}><X size={17} /></button></div>
         <p className="modal-intro">已启用 Server 的工具会提供给所有任务；调用仍受每个任务的阶段和 Agent 权限限制。命令和参数不会经由 shell 解析。</p>
-        <div className="modal-actions"><button type="button" className="primary" onClick={() => void addCodingPreset()}>添加预制编码 MCP Server</button></div>
         <div className="provider-list">
+          <h3 className="mcp-section-heading">已有 MCP 服务器</h3>
           {servers.length ? servers.map((server) => (
             <div className="provider-row mcp-server-row" key={server.id}>
               <div><strong>{server.name}</strong><small>{server.command} · {server.tools.length} 个工具 · {server.enabled ? "已启用" : "已禁用"}</small><small>{server.tools.map((tool) => `${tool.name}（${mcpAccessLabels[tool.access_mode ?? "read-only"]}）`).join("、")}</small></div>
@@ -1242,15 +1244,22 @@ function McpServerModal({
             </div>
           )) : <p>尚未配置 MCP Server。</p>}
         </div>
-        <form onSubmit={submit} className="provider-form">
-          <h3>{editing ? `编辑 ${editing.name}` : "添加本地 stdio Server"}</h3>
+        <section className="mcp-create-section" aria-labelledby="create-mcp-server">
+          <h3 id="create-mcp-server" className="mcp-section-heading">创建编码服务器</h3>
+          <div className="mcp-create-actions">
+            <button type="button" className="primary" onClick={() => void addCodingPreset()}><Plus size={16} /> 添加预制服务器</button>
+            <button type="button" onClick={() => { reset(); setShowCustomForm(true); }}>自主配置服务器</button>
+          </div>
+        </section>
+        {showCustomForm && <form onSubmit={submit} className="provider-form mcp-custom-form">
+          <h3>{editing ? `编辑 ${editing.name}` : "自主配置服务器"}</h3>
           <label>名称<input required value={name} onChange={(event) => setName(event.target.value)} /></label>
           <label>启动命令<input required placeholder="npx 或 python" value={command} onChange={(event) => setCommand(event.target.value)} /></label>
           <label>启动参数（JSON 字符串数组）<textarea required value={argumentsText} onChange={(event) => setArgumentsText(event.target.value)} /></label>
           <label className="checkbox-label"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />启用此 Server</label>
-          {message && <p className={message.includes("失败") || message.includes("Error") ? "error" : "form-message"}>{message}</p>}
-          <div className="modal-actions">{editing && <button type="button" onClick={reset}>新增 Server</button>}<button className="primary">保存并发现工具</button></div>
-        </form>
+          <div className="modal-actions"><button type="button" onClick={() => reset()}>取消</button><button className="primary">保存并发现工具</button></div>
+        </form>}
+        {message && <p className={message.includes("失败") || message.includes("Error") ? "error" : "form-message"}>{message}</p>}
       </section>
     </div>
   );

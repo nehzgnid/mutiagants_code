@@ -1675,3 +1675,33 @@ Verification: static review of `backend/app/main.py`; `git diff --check` passed.
 - Updated routing coverage to verify a message containing write-related terms does not alter the master Agent's returned plan.
 
 Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_workflow_orchestration.py -q` passed with 9 tests and 1 existing Starlette deprecation warning; `npm --prefix frontend run build` passed.
+
+## 2026-07-22
+
+### Plan
+
+- Requirements analysis: simplify the MCP Server dialog to retain only server management and code-server creation, with separate preset and custom configuration paths.
+- High-level design: make the existing-server list the primary view, retain row-level diagnose, edit, and delete actions, and expose two explicit creation actions below it.
+- Detailed design: keep the existing API callbacks unchanged; show the custom stdio form only after choosing custom configuration or editing a listed server.
+
+Verification: reviewed the existing modal component, API routes, and MCP frontend contract test.
+
+### Code
+
+- Reworked the MCP Server dialog into an existing-server list and a compact create-code-server section with preset and custom options.
+- Kept diagnosis, editing, and deletion on each server row; custom configuration and editing now reveal the form on demand.
+
+Verification: `npm --prefix frontend run build` passed; `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_mcp_configuration.py -q` passed with 2 tests; browser inspection verified the dialog at desktop and 390px-wide viewports.
+
+### Code Review
+
+- Confirmed no MCP API endpoint, request payload, server state, or diagnostic behavior changed; only the modal state that controls form visibility was added.
+- Confirmed the listed-server actions remain adjacent to their server row and that custom configuration and editing both reuse the same validated form.
+
+Verification: reviewed `frontend/src/main.tsx` and `frontend/src/styles.css`; `git diff --check` passed.
+
+### Unit Testing
+
+- Updated the frontend MCP contract to require the existing-server list, both server-creation paths, and each retained row action.
+
+Verification: `npm --prefix frontend run build` passed; `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_mcp_configuration.py -q` passed with 2 tests.

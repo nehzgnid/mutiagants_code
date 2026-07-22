@@ -6,7 +6,13 @@ def test_frontend_exposes_mcp_server_and_task_tool_configuration() -> None:
 
     assert '"/api/mcp-servers"' in source
     assert '"/api/mcp-servers/presets/coding"' in source
-    assert "添加预制编码 MCP Server" in source
+    assert "已有 MCP 服务器" in source
+    assert "创建编码服务器" in source
+    assert "添加预制服务器" in source
+    assert "自主配置服务器" in source
+    assert "诊断" in source
+    assert "编辑" in source
+    assert "删除" in source
     assert "所有任务现在都可自动使用其工具" in source
     assert "MCP 工具授权" not in source
 
