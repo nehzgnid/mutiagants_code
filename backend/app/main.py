@@ -1953,6 +1953,9 @@ def stream_continuous_task_message(task_id: str, payload: MessageInput) -> Strea
             for _ in range(12):
                 answer = ""
                 calls: dict[int, dict[str, Any]] = {}
+                activity = {"kind": "network", "title": "模型响应", "detail": "等待模型响应"}
+                update_agent_run(run_id, task_id, activity=activity)
+                yield sse("activity", activity)
                 with httpx.stream("POST", f"{provider_url}/chat/completions", json=request_body, headers=headers, timeout=120) as response:
                     response.raise_for_status()
                     for line in response.iter_lines():

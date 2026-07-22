@@ -189,6 +189,7 @@ def test_streamed_conversation_emits_activity_tokens_and_completion(monkeypatch,
         assert response.status_code == 200
         assert "event: run" in response.text
         assert "event: activity" in response.text
+        assert "等待模型响应" in response.text
         assert "event: token" in response.text
         assert "streamed answer" in response.text
         assert "event: done" in response.text

@@ -2242,29 +2242,6 @@ Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_fron
 
 ### Code
 
-- Requirements analysis: the running Agent card still showed the old complexity-routing copy while the backend now uses the continuous Main Agent loop, and tool calls were not streamed as visible activity updates.
-- High-level design: keep the existing compact activity-list style and expose real continuous-run progress through the same `activity` event shape already used by the card.
-- Detailed design: change the frontend startup activity to `Main Agent / 正在启动连续执行任务`; when the backend executes a tool call, reuse `tool_activity_detail` to persist and stream a matching `tool` activity event.
-
-Verification: reviewed the continuous message stream, running-card event handling, and existing activity copy.
-
-### Code Review
-
-- Confirmed the change does not introduce a new workflow stage model and keeps the visible text in the existing short activity style.
-- Confirmed tool activity persistence and live streaming now use the same payload, so refreshed and active runs stay consistent.
-
-Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, and focused regression assertions.
-
-### Unit Testing
-
-- Added regression coverage for the continuous-run startup copy and streamed tool activity visibility.
-
-Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_message_labels.py backend\\tests\\test_task_conversation.py -q`, `npm --prefix frontend run build`, and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` passed.
-
-## 2026-07-22
-
-### Code
-
 - Requirements analysis: the loading ring was placed outside the Agent bubble, but the running bubble itself was shifted right, so it no longer aligned with normal Agent messages.
 - High-level design: keep the spinner outside the bubble while restoring the Agent bubble to its original message alignment.
 - Detailed design: remove the running-message left margin and max-width reduction, retaining relative positioning on the bubble and the spinner's negative left offset.
@@ -2305,3 +2282,26 @@ Verification: static review of `frontend/src/styles.css` and the updated fronten
 - Updated the frontend message-label regression test to require the external lane, conic-gradient ring, and faster loading animation.
 
 Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_message_labels.py -q`, `npm --prefix frontend run build`, and `git diff --check` passed.
+
+## 2026-07-22
+
+### Code
+
+- Requirements analysis: the running Agent card still showed the old complexity-routing copy while the backend now uses the continuous Main Agent loop, and tool calls were not streamed as visible activity updates.
+- High-level design: keep the existing compact activity-list style and expose real continuous-run progress through the same `activity` event shape already used by the card.
+- Detailed design: change the frontend startup activity to `Main Agent / 正在启动连续执行任务`; emit `模型响应 / 等待模型响应` before each model stream call; when the backend executes a tool call, reuse `tool_activity_detail` to persist and stream a matching `tool` activity event.
+
+Verification: reviewed the continuous message stream, running-card event handling, and existing activity copy.
+
+### Code Review
+
+- Confirmed the change does not introduce a new workflow stage model and keeps the visible text in the existing short activity style.
+- Confirmed tool activity persistence and live streaming now use the same payload, so refreshed and active runs stay consistent.
+
+Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, and focused regression assertions.
+
+### Unit Testing
+
+- Added regression coverage for the continuous-run startup copy, model-wait activity, and streamed tool activity visibility.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_message_labels.py backend\\tests\\test_task_conversation.py -q`, `npm --prefix frontend run build`, and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` passed.
