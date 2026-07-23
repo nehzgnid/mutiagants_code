@@ -158,7 +158,7 @@ function restoreAgentRuns(agentRuns: AgentRun[]): Run[] {
       id: run.id,
       created_at: run.created_at,
       messageId: run.result.message_id,
-      title: run.status === "failed" ? "Agent 运行失败" : "Agent 正在工作",
+      title: run.status === "needs_repair" ? "Agent 待修复" : run.status === "failed" ? "Agent 运行失败" : "Agent 正在工作",
       content: run.result.content ?? "",
       activities: run.result.activities ?? [],
       files: dedupeChangedFiles(run.result.files ?? []),
@@ -518,6 +518,7 @@ function App() {
         content: "",
         activities: [{ kind: "agent", title: "Main Agent", detail: "正在启动连续执行任务" }],
         activeAgent: "Main Agent",
+        workflow: selected.routing_decision ?? undefined,
         stages: [],
         files: [],
         complete: false,
@@ -573,6 +574,14 @@ function App() {
               complete: true,
             }));
           }
+          if (eventName === "repair_required")
+            updateRun(runId, (run) => ({
+              ...run,
+              title: "Agent 待修复",
+              complete: true,
+              error: payload.message,
+              retryContent: content,
+            }));
           if (eventName === "error")
             updateRun(runId, (run) => ({
               ...run,

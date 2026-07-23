@@ -38,6 +38,13 @@ SECRETS_PATH = DATA_DIR / "model-secrets.json"
 # A fast coding turn should normally inspect, edit/verify, then finish.  Further
 # exploration is still available by continuing the task after the handoff.
 CONTINUOUS_TOOL_LOOP_LIMIT = 3
+CONTINUOUS_REVIEW_TEST_EXTRA_ROUNDS = 2
+CONTINUOUS_REPAIR_ROUNDS = 2
+CONTINUOUS_MAX_TOOL_LOOP_LIMIT = 12
+CONTINUOUS_MAX_BUDGET_EXTENSION = 9
+CONTINUOUS_UNLIMITED_BUDGET = True
+CONTINUOUS_WATCHDOG_SECONDS = 30 * 60
+CONTINUOUS_NO_PROGRESS_LIMIT = 3
 CONTINUOUS_WORKING_CONTEXT_MAX_CHARS = 28_000
 CONTINUOUS_TOOL_RESULT_MAX_CHARS = 6_000
 MODEL_STREAM_MAX_ATTEMPTS = 2
@@ -412,6 +419,7 @@ def master_agent_route(provider: ModelProvider, task: Task, content: str, contex
         "Plan only the stages still needed for this request. Do not add requirements or design stages when the supplied context "
         "already contains adequate completed planning; start at implementation, review, testing, or another necessary later stage. "
         "Requests to create, modify, compile, run, deploy, or otherwise execute code must include 编码实现 before review or testing. "
+        "Code-changing requests must also include 代码审核 and 单元测试 in the plan; planning-only and read-only requests may omit them. "
         "You may choose any ordered subset of the development stages, including a planning-only sequence. The workflow label is "
         "descriptive only: simple and full do not impose fixed stage lists. Use read_only only for requests that do not ask for a change. "
         f"Task title: {task.title}\nTask requirement: {task.requirement}\nPersisted task context: {context or '(none)'}\nIncoming message: {content}"
@@ -1044,6 +1052,7 @@ BASE_TOOLS = [
 ]
 PATCH_TOOL = {"type": "function", "function": {"name": "apply_patch", "description": "Atomically apply precise text edits. For existing files, always use small exact old_text/new_text replacements like a diff; do not replace the whole file. Use old_text=null only to create a brand-new file that does not already exist. Read files first and supply their SHA-256 content hash as expected_hash. In manual confirmation mode the patch waits for user approval.", "parameters": {"type": "object", "properties": {"edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "expected_hash": {"type": ["string", "null"], "description": "SHA-256 hash of the file content read before editing. Required for existing files."}, "old_text": {"type": ["string", "null"], "description": "Existing files: exact text snippet to replace. New files only: null."}, "new_text": {"type": "string", "description": "Replacement text for old_text, or complete content only when creating a new file."}}, "required": ["path", "expected_hash", "old_text", "new_text"]}}}, "required": ["edits"]}}}
 COMMAND_TOOL = {"type": "function", "function": {"name": "run_command", "description": "Start a local command with streamed output. Available only after the user selected full access.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "working_directory": {"type": "string"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800}}, "required": ["command"]}}}
+BUDGET_TOOL = {"type": "function", "function": {"name": "request_more_rounds", "description": "Request a bounded number of additional Main Agent decision rounds when concrete work remains. Explain the blocker and request no more than 3 rounds.", "parameters": {"type": "object", "properties": {"reason": {"type": "string", "minLength": 1}, "requested_rounds": {"type": "integer", "minimum": 1, "maximum": 3}}, "required": ["reason", "requested_rounds"]}}}
 
 
 def tools_for(permission_mode: str) -> list[dict[str, Any]]:
@@ -1087,6 +1096,8 @@ def tools_for_task(task: Task, db: Session | None = None, continuous: bool = Fal
     """Expose globally configured MCP tools that satisfy the task access policy."""
     can_write = task_can_write(task) if continuous else write_enabled(task)
     selected_tools = tools_for(task.permission_mode) if can_write else list(BASE_TOOLS)
+    if continuous:
+        selected_tools.append(BUDGET_TOOL)
     if not db:
         return selected_tools
     for server in enabled_mcp_servers(db):
@@ -1146,14 +1157,18 @@ def tool_activity_detail(db: Session, task: Task, function_name: str) -> str:
     return f"正在执行 {function_name}"
 
 
-def continuous_tool_activity(db: Session, task: Task, function_name: str) -> dict[str, str]:
+def continuous_tool_activity(db: Session, task: Task, function_name: str, arguments: dict[str, Any] | None = None) -> dict[str, str]:
     agent_by_tool = {
         "list_files": "阅读 Agent",
         "read_file": "阅读 Agent",
         "apply_patch": "执行 Agent",
         "run_command": "执行 Agent",
     }
-    return {"kind": "tool", "title": agent_by_tool.get(function_name, "工具 Agent"), "detail": tool_activity_detail(db, task, function_name)}
+    title = agent_by_tool.get(function_name, "工具 Agent")
+    command = str((arguments or {}).get("command", "")).lower()
+    if function_name == "run_command" and any(marker in command for marker in ("pytest", "npm test", "mvn test", "gradle test", "cargo test")):
+        title = "测试 Agent"
+    return {"kind": "tool", "title": title, "detail": tool_activity_detail(db, task, function_name)}
 
 
 class TaskInput(BaseModel):
@@ -1814,7 +1829,12 @@ def conversation_request(db: Session, task: Task, provider: ModelProvider, histo
     system_message = (
         "You are the single main coding agent for this task. Reply in Chinese. "
         "Continuously decide the next useful action from the user goal and tool results: inspect, edit, run verification, "
-        "review, or finish. There are no mandatory workflow stages and no separate agents. "
+        "review, or finish. The master agent may assign the planned reading, execution, review, and testing roles; follow the supplied "
+        "workflow plan when one is present, while keeping one continuous tool loop. "
+        "If the plan includes code review or unit testing, do not stop after editing: batch the review inspection and test command into the remaining tool calls before finishing. "
+        "If a verification command fails, use the next decision round to diagnose and repair the reported error, then rerun the verification before summarizing. "
+        "After a verification failure, do not rerun the identical command until an apply_patch repair has completed. "
+        "If concrete work remains but the budget is insufficient, call request_more_rounds with a concise reason; the controller may approve a bounded extension. "
         "Use supplied tools before making claims about repository contents. The UI records tool activity separately, so the final "
         "answer must only report the completed result, verification, and genuine blockers; do not expose chain-of-thought. "
         "Use concise GitHub-Flavored Markdown and do not paste full changed source files. "
@@ -1824,7 +1844,8 @@ def conversation_request(db: Session, task: Task, provider: ModelProvider, histo
         "When editing existing files, use precise small old_text/new_text replacements; never use old_text=null or whole-file replacement for existing files. "
         "When a patch requires user approval, wait for its tool result before deciding what to do next. "
         "Do not commit, grant external path access, or elevate permission without an explicit user action. "
-        f"Permission: {permission_descriptions[task.permission_mode]}"
+        f"Permission: {permission_descriptions[task.permission_mode]} "
+        f"Master-agent workflow plan: {json.dumps(task.routing_decision, ensure_ascii=False) if task.routing_decision else '(none)'}."
     )
     snapshot = dump_provider(provider)
     return {
@@ -2022,9 +2043,15 @@ def stream_continuous_task_message(task_id: str, payload: MessageInput) -> Strea
         active = db.scalar(select(AgentRun).where(AgentRun.task_id == task_id, AgentRun.status.in_({"running", "awaiting_approval"})))
         if active:
             raise HTTPException(409, "This task already has an active Agent run")
+        try:
+            decision = master_agent_route(provider, task, content, routing_context(db, task)) if should_replan(task, content) else None
+        except RoutingError as error:
+            raise HTTPException(502, str(error)) from error
         db.add(TaskMessage(id=str(uuid.uuid4()), task_id=task_id, role="user", content=content, created_at=now()))
+        if decision:
+            apply_routing_decision(task, decision)
         task.status, task.current_stage, task.assigned_agent = "in_progress", "continuous_run", "Main Agent"
-        task.workflow_type, task.task_kind, task.routing_decision, task.updated_at = "continuous", "development", None, now()
+        task.updated_at = now()
         run_created_at = now()
         run = AgentRun(id=str(uuid.uuid4()), task_id=task_id, status="running", result={
             "timing": {"started_at": run_created_at.isoformat(), "total_ms": 0, "agents": {}},
@@ -2034,9 +2061,15 @@ def stream_continuous_task_message(task_id: str, payload: MessageInput) -> Strea
             select(TaskMessage).where(TaskMessage.task_id == task_id, TaskMessage.context_compacted.is_(False)).order_by(TaskMessage.created_at, TaskMessage.id)
         )]
         request_body, headers = conversation_request(db, task, provider, history, continuous=True)
+        workflow_payload = task.routing_decision if isinstance(task.routing_decision, dict) else None
+        planned_stages = set(workflow_payload.get("required_stages", [])) if workflow_payload else set()
+        loop_limit = CONTINUOUS_TOOL_LOOP_LIMIT
+        if {CODE_REVIEW_STAGE, UNIT_TESTING_STAGE} & planned_stages:
+            loop_limit += CONTINUOUS_REVIEW_TEST_EXTRA_ROUNDS
         provider_url, run_id = api_root(provider.base_url), run.id
 
     def event_stream():
+        nonlocal loop_limit
         # Audit history is complete; request_body carries only the bounded working context.
         audit_messages = list(request_body["messages"])
 
@@ -2137,11 +2170,31 @@ def stream_continuous_task_message(task_id: str, payload: MessageInput) -> Strea
 
         try:
             yield sse("run", {"id": run_id, "status": "running"})
+            if workflow_payload:
+                update_agent_run(run_id, task_id, workflow=workflow_payload)
+                yield sse("workflow", workflow_payload)
             update_agent_run(run_id, task_id, activity={"kind": "agent", "title": "Main Agent", "detail": "连续执行任务"})
             yield sse("activity", {"kind": "agent", "title": "Main Agent", "detail": "连续执行任务"})
-            for _ in range(CONTINUOUS_TOOL_LOOP_LIMIT):
+            repair_rounds = 0
+            budget_extensions = 0
+            repair_pending = False
+            repair_patch_applied = False
+            failed_command = ""
+            started_wall = time.perf_counter()
+            repeated_rounds = 0
+            previous_round_signature = ""
+            round_index = 0
+            while CONTINUOUS_UNLIMITED_BUDGET or round_index < loop_limit:
+                if CONTINUOUS_UNLIMITED_BUDGET and time.perf_counter() - started_wall >= CONTINUOUS_WATCHDOG_SECONDS:
+                    update_agent_run(run_id, task_id, status="needs_repair", error="连续执行达到安全运行时限")
+                    yield sse("repair_required", {"message": "连续执行达到安全运行时限，请继续当前任务"})
+                    return
+                round_index += 1
+                if repair_pending:
+                    update_agent_run(run_id, task_id, status="running", activity={"kind": "agent", "title": "修复 Agent", "detail": "继续处理验证失败"})
                 answer = ""
                 calls: dict[int, dict[str, Any]] = {}
+                repair_needed = False
                 activity = {"kind": "network", "title": "Main Agent", "detail": "等待模型响应"}
                 update_agent_run(run_id, task_id, activity=activity)
                 yield sse("activity", activity)
@@ -2195,9 +2248,45 @@ def stream_continuous_task_message(task_id: str, payload: MessageInput) -> Strea
                         arguments = json.loads(call["function"]["arguments"] or "{}")
                         yield sse("tool_call", {"name": name, "arguments": arguments})
                         tool_started_at = time.perf_counter()
+                        if name == "request_more_rounds":
+                            requested = max(1, min(int(arguments.get("requested_rounds", 1)), 3))
+                            reason = str(arguments.get("reason", "")).strip()
+                            remaining = requested if CONTINUOUS_UNLIMITED_BUDGET else max(0, min(
+                                CONTINUOUS_MAX_TOOL_LOOP_LIMIT - loop_limit,
+                                CONTINUOUS_MAX_BUDGET_EXTENSION - budget_extensions,
+                            ))
+                            granted = min(requested, remaining) if reason else 0
+                            if granted:
+                                loop_limit += granted
+                                budget_extensions += granted
+                            result = json.dumps({
+                                "approved": bool(granted), "granted_rounds": granted,
+                                "remaining_extension": "unlimited" if CONTINUOUS_UNLIMITED_BUDGET else max(0, CONTINUOUS_MAX_BUDGET_EXTENSION - budget_extensions),
+                                "message": "Additional rounds approved." if granted else "Additional rounds denied; finish or report the blocker.",
+                            }, ensure_ascii=False)
+                            activity = {"kind": "agent", "title": "Main Agent", "detail": f"申请额外预算：{granted} 轮"}
+                            update_agent_run(run_id, task_id, activity=activity)
+                            yield sse("activity", activity)
+                            yield from publish_timing("Main Agent", "budget_ms", tool_started_at)
+                            tool_message = {"role": "tool", "tool_call_id": call["id"], "content": result}
+                            request_body["messages"].append(tool_message)
+                            audit_messages.append(tool_message)
+                            save_agent_run_context(run_id, task_id, audit_messages)
+                            continue
+                        if name == "run_command" and repair_pending and not repair_patch_applied and str(arguments.get("command", "")) == failed_command:
+                            result = json.dumps({"error": "The previous verification failed. Apply a code repair before rerunning the same command."}, ensure_ascii=False)
+                            activity = {"kind": "agent", "title": "修复 Agent", "detail": "必须先修复代码，再重新验证"}
+                            update_agent_run(run_id, task_id, activity=activity)
+                            yield sse("activity", activity)
+                            yield from publish_timing("修复 Agent", "tool_ms", tool_started_at)
+                            tool_message = {"role": "tool", "tool_call_id": call["id"], "content": result}
+                            request_body["messages"].append(tool_message)
+                            audit_messages.append(tool_message)
+                            save_agent_run_context(run_id, task_id, audit_messages)
+                            continue
                         with SessionLocal() as db:
                             current_task = db.get(Task, task_id)
-                            activity = continuous_tool_activity(db, current_task, name)
+                            activity = continuous_tool_activity(db, current_task, name, arguments)
                             update_agent_run(run_id, task_id, activity=activity)
                             yield sse("activity", activity)
                             result = execute_tool(current_task, name, arguments, db)
@@ -2208,6 +2297,21 @@ def stream_continuous_task_message(task_id: str, payload: MessageInput) -> Strea
                                 result = json.dumps((yield from wait_for_operation(operation["id"], activity["title"])), ensure_ascii=False)
                                 update_agent_run(run_id, task_id, status="running")
                                 operation = json.loads(result)
+                            command_failed = operation.get("status") == "failed" or operation.get("result", {}).get("returncode", 0) not in {0, None}
+                            repair_needed = repair_needed or command_failed
+                            if command_failed:
+                                repair_pending = True
+                                repair_patch_applied = False
+                                failed_command = str(arguments.get("command", "")) if name == "run_command" else failed_command
+                                request_body["messages"].append({"role": "system", "content": "Verification failed. Diagnose the reported error, apply a patch, then rerun the verification command."})
+                                update_agent_run(run_id, task_id, status="needs_repair", activity={"kind": "agent", "title": "修复 Agent", "detail": "验证失败，准备修复"})
+                                yield sse("activity", {"kind": "agent", "title": "修复 Agent", "detail": "验证失败，准备修复"})
+                            elif name == "apply_patch" and operation.get("status") == "completed":
+                                repair_patch_applied = True
+                            elif name == "run_command" and repair_patch_applied:
+                                repair_pending = False
+                                repair_patch_applied = False
+                                failed_command = ""
                         if name == "apply_patch":
                             if operation.get("status") == "completed":
                                 for item in (operation.get("result") or {}).get("files", []):
@@ -2222,6 +2326,25 @@ def stream_continuous_task_message(task_id: str, payload: MessageInput) -> Strea
                     audit_messages.append(tool_message)
                     save_agent_run_context(run_id, task_id, audit_messages)
                 request_body["messages"] = compact_continuous_messages(request_body["messages"])
+                round_signature = json.dumps([(call["function"]["name"], call["function"].get("arguments", "")) for call in tool_calls], sort_keys=True)
+                repeated_rounds = repeated_rounds + 1 if round_signature == previous_round_signature else 0
+                previous_round_signature = round_signature
+                if repeated_rounds >= CONTINUOUS_NO_PROGRESS_LIMIT:
+                    update_agent_run(run_id, task_id, status="needs_repair", error="连续多轮没有产生新的进展")
+                    yield sse("repair_required", {"message": "连续多轮没有产生新的进展，请继续当前任务"})
+                    return
+                if repair_needed and repair_rounds < CONTINUOUS_REPAIR_ROUNDS:
+                    repair_rounds += 1
+                    loop_limit += 1
+            if repair_pending:
+                update_agent_run(run_id, task_id, status="needs_repair", error="验证失败，修复预算已耗尽；请继续当前任务以完成修复")
+                with SessionLocal() as db:
+                    task = db.get(Task, task_id)
+                    if task:
+                        task.status, task.updated_at = "needs_repair", now()
+                        db.commit()
+                yield sse("repair_required", {"message": "验证失败，修复预算已耗尽；请继续当前任务以完成修复"})
+                return
             answer = yield from summarize_after_tool_limit()
             message = complete_run(answer, status="awaiting_input", stage="continuous_run")
             yield sse("done", {"message": dump_message(message)})

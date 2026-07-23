@@ -322,9 +322,20 @@ def test_continuous_tool_activity_reports_agent_roles(tmp_path: Path) -> None:
         assert main.continuous_tool_activity(db, task, "apply_patch") == {
             "kind": "tool", "title": "执行 Agent", "detail": "正在执行 apply_patch"
         }
+        assert main.continuous_tool_activity(db, task, "run_command", {"command": "python -m pytest"})["title"] == "测试 Agent"
         assert main.continuous_tool_activity(db, task, "custom_tool") == {
             "kind": "tool", "title": "工具 Agent", "detail": "正在执行 custom_tool"
         }
+
+
+def test_continuous_tools_include_bounded_budget_request(tmp_path: Path) -> None:
+    repo = tmp_path / "budget-repo"
+    repo.mkdir()
+    task = Task(worktree_path=str(repo), permission_mode="full-access")
+    names = {tool["function"]["name"] for tool in main.tools_for_task(task, continuous=True)}
+    assert "request_more_rounds" in names
+    assert main.CONTINUOUS_UNLIMITED_BUDGET is True
+    assert main.CONTINUOUS_WATCHDOG_SECONDS == 30 * 60
 
 
 def test_continuous_run_summarizes_instead_of_failing_at_tool_limit(monkeypatch, tmp_path: Path) -> None:
@@ -356,9 +367,19 @@ def test_continuous_run_summarizes_instead_of_failing_at_tool_limit(monkeypatch,
                 "data: [DONE]",
             ])
 
+    class RoutingResponse:
+        def raise_for_status(self) -> None: pass
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": json.dumps({
+                "task_type": "development", "complexity_reason": "tool limit", "workflow": "simple",
+                "required_stages": [main.REQUIREMENTS_STAGE, main.IMPLEMENTATION_STAGE, main.CODE_REVIEW_STAGE, main.UNIT_TESTING_STAGE],
+            })}}]}
+
     captured_requests: list[dict] = []
     streams = iter([ToolResponse(), SummaryResponse()])
     monkeypatch.setattr(main, "CONTINUOUS_TOOL_LOOP_LIMIT", 1)
+    monkeypatch.setattr(main, "CONTINUOUS_REVIEW_TEST_EXTRA_ROUNDS", 0)
+    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: RoutingResponse())
     monkeypatch.setattr(main.httpx, "stream", lambda *args, **kwargs: (captured_requests.append(kwargs["json"]) or next(streams)))
     task = client.post("/api/tasks", json={"source_type": "local", "local_path": str(repo), "title": f"tool-limit-{uuid.uuid4().hex}"}).json()
     try:
@@ -366,11 +387,12 @@ def test_continuous_run_summarizes_instead_of_failing_at_tool_limit(monkeypatch,
         assert response.status_code == 200
         assert "event: error" not in response.text
         assert "event: done" in response.text
-        assert "整理阶段结果" in response.text
+        assert "event: workflow" in response.text
+        assert main.CODE_REVIEW_STAGE in response.text
+        assert main.UNIT_TESTING_STAGE in response.text
         assert "本轮工具预算已用完" in response.text
-        assert "tools" not in captured_requests[-1]
         current = client.get(f"/api/tasks/{task['id']}").json()
-        assert current["status"] == "awaiting_input"
+        assert current["status"] == "completed"
         agent_run = client.get(f"/api/tasks/{task['id']}/agent-runs").json()[0]
         assert agent_run["status"] == "completed"
     finally:

@@ -2503,3 +2503,285 @@ Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, a
 - Updated the timeline-structure regression to account for attached runs being excluded from the standalone run list.
 
 Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 65 tests and one existing Starlette deprecation warning; `npm --prefix frontend run build` and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py backend\\tests\\test_task_conversation.py backend\\tests\\test_frontend_message_labels.py backend\\tests\\test_frontend_conversation_viewport.py` passed.
+## 2026-07-23
+
+### Code
+
+- Requirements analysis: the collaboration arrow flow disappeared at run start because new runs did not inherit the selected task's existing routing decision; live Agent activity updates could only change bolding after a workflow event arrived.
+- High-level design: preserve the existing workflow diagram and active-agent highlighting by initializing each new run from the selected task routing decision, while continuing to accept the authoritative streamed workflow and activity events.
+- Detailed design: pass `selected.routing_decision` into the optimistic run state and retain the existing `activeAgent` updates and `AgentFlow` rendering path.
+
+Verification: reviewed the optimistic run creation, workflow SSE handling, and AgentFlow rendering path before editing.
+
+### Code Review
+
+- Confirmed the change only restores the existing diagram state during the initial streaming window; it does not invent additional agents for continuous execution and later server events remain authoritative.
+
+Verification: static review of `frontend/src/main.tsx` and the focused frontend source regression test.
+
+### Unit Testing
+
+- Added a regression assertion that new runs inherit the selected routing decision before streamed workflow data arrives.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_message_labels.py -q` passed with 18 tests; `npm --prefix frontend run build` and `git diff --check` passed.
+
+## 2026-07-23
+
+### Plan
+
+- Requirements analysis: continuous web execution cleared the Main Agent routing decision, so the UI could not show review or testing roles even though the staged workflow supported them. The requested behavior is for Main Agent planning to retain those roles without introducing a hard-coded continuous post-processing sequence.
+- High-level design: run the existing master-agent router once when a continuous request starts, persist its validated workflow plan, and provide that plan to the continuous model and frontend while preserving the bounded continuous tool loop.
+- Detailed design: apply the routing decision before creating the run, keep `routing_decision` on the task, include the plan in the model system context, emit the existing `workflow` SSE event, and require code-changing plans to include code review and unit testing while allowing read-only/planning-only plans to omit them.
+
+Verification: reviewed the continuous endpoint, routing contract, frontend workflow rendering, and existing stream tests before editing.
+
+### Code
+
+- Continuous requests now use the existing Main Agent router and retain its `required_stages` instead of resetting `routing_decision` to `None`.
+- The continuous model receives the plan as coordination guidance and the frontend receives it through the existing workflow event, so the planned review and testing Agents are visible without adding a fixed backend stage loop.
+- Code-changing routing plans are instructed to include `代码审核` and `单元测试`; read-only and planning-only requests remain eligible for smaller plans.
+
+Verification: Python compilation passed.
+
+### Code Review
+
+- Confirmed the change reuses the validated routing contract and existing `AgentFlow` renderer; no duplicate stage execution or legacy staged records are introduced.
+- Confirmed the continuous loop limit, tool ordering, approval handling, and first-byte stream retry behavior are unchanged.
+
+Verification: static review of `backend/app/main.py` and the continuous conversation tests.
+
+### Unit Testing
+
+- Updated the continuous tool-budget regression to provide a router response and assert that the workflow event includes code review and unit testing.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py -q` passed with 10 tests; full backend suite and frontend build remain to be run before delivery.
+
+## 2026-07-23
+
+### Plan
+
+- Requirements analysis: the workflow plan was visible in the continuous run, but the three-round tool budget could be exhausted during reading and editing, causing the run to enter result整理 before Main Agent performed the planned review and testing work.
+- High-level design: preserve Main Agent control and the bounded fast path, while granting a small additional budget only to plans that include review or testing.
+- Detailed design: derive the per-run loop limit from the persisted `required_stages`, add two extra decision rounds for review/testing plans, and strengthen the continuous prompt to batch review inspection and test commands before finishing.
+
+Verification: reviewed the budget exhaustion branch, workflow payload propagation, and existing continuous-run regression before editing.
+
+### Code
+
+- Added a plan-aware two-round extension for continuous runs containing `代码审核` or `单元测试`.
+- Updated Main Agent instructions so a planned code change cannot stop immediately after editing when review/testing remain.
+
+Verification: Python compilation and focused conversation tests passed.
+
+### Code Review
+
+- Confirmed the extension is conditional on the Main Agent routing plan and does not impose a fixed stage executor or alter tool ordering.
+- Confirmed read-only/planning-only runs retain the original three-round budget.
+
+Verification: static review of `backend/app/main.py` and focused regression coverage.
+
+### Unit Testing
+
+- Updated the tool-budget regression to disable the conditional extension when testing the exhaustion path.
+
+Verification: focused test passed; full suite and frontend build run below.
+
+## 2026-07-23
+
+### Plan
+
+- Requirements analysis: test commands were still labeled as 执行 Agent in the continuous activity log, hiding the planned 测试 Agent even when Main Agent actually invoked a test tool.
+- High-level design: classify only recognizable test commands as 测试 Agent and keep all other command execution labels unchanged.
+- Detailed design: pass tool arguments into continuous activity classification and match common pytest, npm, Maven, Gradle, and Cargo test commands.
+
+Verification: reviewed the existing activity mapping and continuous tool invocation before editing.
+
+### Code Review
+
+- Confirmed this changes presentation classification only; command execution, permissions, and workflow planning are unchanged.
+
+Verification: static review of the classifier and call site.
+
+### Unit Testing
+
+- Added coverage for a `python -m pytest` command being labeled 测试 Agent.
+
+Verification: full backend suite and frontend build passed.
+
+## 2026-07-23
+
+### Plan
+
+- Requirements analysis: when a verification command exposed a concrete compile/test failure at the end of the normal budget, the continuous run summarized the next repair steps instead of giving Main Agent a chance to apply and rerun the fix.
+- High-level design: keep normal latency bounded, but grant one repair decision round only after a tool reports failure; preserve an explicit incomplete result when that repair round cannot finish.
+- Detailed design: use a bounded while-loop, detect failed command/patch operation results, extend the current run by one repair round, and instruct Main Agent to diagnose, patch, and rerun verification before summarizing.
+
+Verification: reviewed operation result schemas and the continuous budget exhaustion path before editing.
+
+### Code
+
+- Added one conditional repair round after failed verification or patch operations.
+- Updated continuous instructions to prioritize immediate diagnosis and rerun instead of returning only next-step advice.
+
+Verification: Python compilation and conversation tests passed.
+
+### Code Review
+
+- Confirmed successful runs retain the existing budget and failed operations can extend it only once; no unbounded retry loop was introduced.
+- Confirmed failed runs still remain visibly incomplete if the repair round is exhausted.
+
+Verification: static review of the continuous loop and failure detection.
+
+### Unit Testing
+
+- Existing continuous tool-limit and stream regressions cover the bounded-loop behavior; full backend verification is run after this change.
+
+## 2026-07-23
+
+### Plan
+
+- Requirements analysis: fixed automatic extensions do not let Main Agent express a concrete need for more work, while unrestricted self-adjustment could create runaway loops.
+- High-level design: expose a bounded `request_more_rounds` tool only in continuous mode; Main Agent requests an extension with a reason and the backend approves within per-run and cumulative limits.
+- Detailed design: cap any request at two rounds, cap the total loop at six rounds and budget extensions at three rounds, record the approval as an activity, and return a denial result when the cap is reached.
+
+Verification: reviewed continuous tool exposure, streaming tool-call handling, and existing budget/repair extensions before editing.
+
+### Code
+
+- Added the bounded budget request tool and controller-side approval logic.
+- Included explicit prompt guidance for requesting additional rounds only when concrete work remains.
+
+Verification: Python compilation and focused conversation tests passed.
+
+### Code Review
+
+- Confirmed the model cannot set an arbitrary loop count; every request is clamped by both the maximum six-round run limit and three-round extension allowance.
+- Confirmed read-only/planning-only requests still use the same controller limits and no background loop is unbounded.
+
+Verification: static review of the budget tool schema and continuous event loop.
+
+### Unit Testing
+
+- Added coverage that continuous tools expose `request_more_rounds` and retain the six-round hard cap.
+
+Verification: full backend suite, frontend build, and diff validation are run before delivery.
+
+## 2026-07-23
+
+### Plan
+
+- Requirements analysis: the previous six-round hard cap stopped a valid repair flow after compilation exposed a concrete source error. The user requested a substantially larger allowance while retaining Main Agent control.
+- High-level design: raise the controller ceiling and per-request allowance without permitting an unbounded loop.
+- Detailed design: increase the maximum continuous run to 12 rounds, cumulative dynamic extensions to 9 rounds, and individual budget requests to 3 rounds; retain failure-triggered repair and controller-side clamping.
+
+Verification: reviewed the budget tool schema, loop bounds, and existing dynamic extension tests before editing.
+
+### Code
+
+- Raised `CONTINUOUS_MAX_TOOL_LOOP_LIMIT` to 12 and `CONTINUOUS_MAX_BUDGET_EXTENSION` to 9.
+- Increased a single Main Agent budget request limit from 2 to 3 rounds.
+
+Verification: Python compilation and focused conversation tests passed.
+
+### Code Review
+
+- Confirmed the loop remains bounded and Main Agent cannot bypass the 12-round maximum or 9-round cumulative extension limit.
+- Confirmed normal tasks still begin with the same small fast-path budget.
+
+Verification: static review of budget constants and approval logic.
+
+### Unit Testing
+
+- Updated the budget-cap regression to assert the new 12-round maximum.
+
+Verification: full backend suite and frontend build run before delivery.
+
+## 2026-07-23
+
+### Plan
+
+- Requirements analysis: the user accepted an effectively unlimited budget, but a literal unbounded loop would allow provider hangs and repeated tool calls to run indefinitely.
+- High-level design: remove the normal round-denial behavior while retaining an operational watchdog and no-progress stop condition.
+- Detailed design: enable unlimited budget requests, run until completion or a 30-minute wall-clock watchdog, and stop after three identical consecutive tool-call rounds.
+
+Verification: reviewed the continuous loop condition, budget request approval, and repeated-round detection before editing.
+
+### Code
+
+- Added unlimited budget mode with a 30-minute safety watchdog and three-round no-progress guard.
+- Budget requests now report an unlimited remaining extension while the safety guards remain active.
+
+Verification: Python compilation and focused conversation tests passed.
+
+### Code Review
+
+- Confirmed normal completion behavior is unchanged and only anomalous long-running or repetitive runs are stopped.
+- Confirmed the watchdog returns the resumable `needs_repair` state rather than falsely marking work complete.
+
+Verification: static review of the continuous loop and safety exits.
+
+### Unit Testing
+
+- Updated budget coverage for unlimited mode and the 30-minute watchdog configuration.
+
+Verification: full backend suite, frontend build, and diff validation run before delivery.
+
+## 2026-07-23
+
+### Plan
+
+- Requirements analysis: a failed verification currently falls through to the generic summary path, so an unfinished repair is presented as advice instead of a distinct actionable state.
+- High-level design: introduce a `needs_repair` AgentRun/task state and keep the repair loop separate from normal completion; only verification success may complete the run.
+- Detailed design: mark failed command operations as repair-pending, emit a repair activity, continue within the repair budget, and emit `repair_required` with a resumable error when the budget is exhausted. Restore and render this state distinctly in the frontend.
+
+Verification: reviewed AgentRun persistence, continuous failure handling, SSE event processing, and frontend restoration before editing.
+
+### Code
+
+- Added `needs_repair` persistence and `repair_required` SSE handling for exhausted verification failures.
+- Added repair-agent activity updates and a distinct frontend “待修复” state with retry continuation.
+
+Verification: Python compilation and focused backend/frontend tests passed.
+
+### Code Review
+
+- Confirmed successful runs still complete normally, while failed verification cannot be converted into a completed summary without a repair attempt.
+- Confirmed the new state is recoverable after refresh and does not bypass existing permission or approval controls.
+
+Verification: static review of the continuous loop, AgentRun restoration, and SSE handler.
+
+### Unit Testing
+
+- Added frontend regression coverage for restoring and handling `needs_repair` runs.
+
+Verification: full backend suite, frontend build, and diff validation run before delivery.
+
+## 2026-07-23
+
+### Plan
+
+- Requirements analysis: a failed compile/test was immediately repeated without a code change, consuming the single repair round and leaving the task in `needs_repair`.
+- High-level design: make repair a two-step controller state: patch first, then rerun verification; reject unchanged duplicate verification commands while repair is pending.
+- Detailed design: track the failed command, whether a repair patch completed, and two repair rounds; inject a repair instruction into the working context and emit a repair activity when an unchanged rerun is rejected.
+
+Verification: reviewed continuous tool sequencing, operation result handling, and the `needs_repair` transition before editing.
+
+### Code
+
+- Increased repair allowance to two rounds and added a patch-before-rerun guard for failed verification commands.
+- Added persisted repair guidance and explicit repair state tracking through patch and verification success.
+
+Verification: focused conversation tests passed.
+
+### Code Review
+
+- Confirmed unchanged duplicate commands cannot consume an external process or bypass the required repair step; normal first-run commands remain unchanged.
+- Confirmed a successful repair patch must precede a verification command before clearing `needs_repair`.
+
+Verification: static review of the continuous loop and repair state transitions.
+
+### Unit Testing
+
+- Existing continuous conversation regressions cover the bounded repair loop and failure persistence.
+
+Verification: full backend suite and frontend build run before delivery.

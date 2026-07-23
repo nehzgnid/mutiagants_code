@@ -83,6 +83,12 @@ def test_streaming_run_receives_and_renders_the_master_workflow_before_completio
     assert "{run.workflow && <AgentFlow decision={run.workflow} activeAgent={run.activeAgent} />}" in source
 
 
+def test_new_runs_keep_the_selected_workflow_until_streaming_updates_arrive() -> None:
+    source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+
+    assert "workflow: selected.routing_decision ?? undefined" in source
+
+
 def test_agent_flow_highlights_only_the_current_agent() -> None:
     source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
     styles = (Path(__file__).parents[2] / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
@@ -150,3 +156,10 @@ def test_agent_run_renders_persisted_timing_by_role_and_work_type() -> None:
     assert "operation_wait_ms" in source
     assert "{run.timing && <TimingSummary timing={run.timing} />}" in source
     assert ".timing-summary" in styles
+
+
+def test_frontend_preserves_a_needs_repair_run_as_actionable() -> None:
+    source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+
+    assert 'run.status === "needs_repair"' in source
+    assert 'eventName === "repair_required"' in source
