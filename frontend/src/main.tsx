@@ -68,9 +68,15 @@ type SourceMode = "local" | "github";
 type ActivityItem = { kind: string; title: string; detail: string };
 type ChangedFile = { path: string; action: string };
 type RunStage = { stage: string; agent: string; status: string; output?: string };
+type RunTiming = {
+  started_at: string;
+  total_ms: number;
+  agents: Record<string, Record<string, number>>;
+};
 type Run = {
   id: string;
   created_at: string;
+  messageId?: string;
   title?: string;
   content: string;
   activities: ActivityItem[];
@@ -81,6 +87,7 @@ type Run = {
   stages: RunStage[];
   error?: string;
   retryContent?: string;
+  timing?: RunTiming;
 };
 type AgentRun = {
   id: string;
@@ -92,11 +99,13 @@ type AgentRun = {
     files?: ChangedFile[];
     stages?: RunStage[];
     error?: string;
+    message_id?: string;
     workflow?: RoutingDecision;
+    timing?: RunTiming;
   };
 };
 type ConversationItem =
-  | { kind: "message"; created_at: string; message: TaskMessage }
+  | { kind: "message"; created_at: string; message: TaskMessage; trace?: Run }
   | { kind: "run"; created_at: string; run: Run };
 type StageRun = {
   id: string;
@@ -128,13 +137,27 @@ function dedupeChangedFiles(files: ChangedFile[]): ChangedFile[] {
   );
 }
 
+function hasVisibleRunResult(run: AgentRun): boolean {
+  const result = run.result;
+  return Boolean(
+    result.content ||
+    result.error ||
+    result.workflow ||
+    result.timing ||
+    (result.activities?.length ?? 0) > 0 ||
+    (result.files?.length ?? 0) > 0 ||
+    (result.stages?.length ?? 0) > 0
+  );
+}
+
 function restoreAgentRuns(agentRuns: AgentRun[]): Run[] {
   return agentRuns
-    .filter((run) => run.status !== "completed" || (run.result.stages?.length ?? 0) > 0)
+    .filter((run) => run.status !== "completed" || hasVisibleRunResult(run))
     .reverse()
     .map((run) => ({
       id: run.id,
       created_at: run.created_at,
+      messageId: run.result.message_id,
       title: run.status === "failed" ? "Agent 运行失败" : "Agent 正在工作",
       content: run.result.content ?? "",
       activities: run.result.activities ?? [],
@@ -144,8 +167,16 @@ function restoreAgentRuns(agentRuns: AgentRun[]): Run[] {
       activeAgent: [...(run.result.activities ?? [])].reverse().find((activity) => activity.kind === "agent")?.title,
       stages: run.result.stages ?? [],
       error: run.result.error,
+      timing: run.result.timing,
     }));
 }
+
+function runMatchesMessage(run: Run, message: TaskMessage): boolean {
+  return run.complete && !run.error && Boolean(run.content) && (
+    run.messageId === message.id || (!run.messageId && run.content === message.content)
+  );
+}
+
 const api = async <T,>(url: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -281,9 +312,17 @@ function App() {
     setScrollToLatestRequest((request) => request + 1);
     setSelected(task);
   };
+  const attachedRunIds = new Set<string>();
+  const messageTimelineItems: ConversationItem[] = messages.map((message) => {
+    const trace = message.role === "assistant"
+      ? runs.find((run) => !attachedRunIds.has(run.id) && runMatchesMessage(run, message))
+      : undefined;
+    if (trace) attachedRunIds.add(trace.id);
+    return { kind: "message", created_at: message.created_at, message, trace };
+  });
   const timelineItems: ConversationItem[] = [
-    ...messages.map((message) => ({ kind: "message" as const, created_at: message.created_at, message })),
-    ...runs.map((run) => ({ kind: "run" as const, created_at: run.created_at, run })),
+    ...messageTimelineItems,
+    ...runs.filter((run) => !attachedRunIds.has(run.id)).map((run) => ({ kind: "run" as const, created_at: run.created_at, run })),
   ].sort((left, right) => {
     const timeDifference = Date.parse(left.created_at) - Date.parse(right.created_at);
     return timeDifference || (left.kind === "message" ? -1 : 1);
@@ -482,6 +521,7 @@ function App() {
         stages: [],
         files: [],
         complete: false,
+        timing: { started_at: new Date().toISOString(), total_ms: 0, agents: {} },
       },
     ]);
     setDraft("");
@@ -514,6 +554,8 @@ function App() {
               activities: [...run.activities, payload],
               activeAgent: payload.kind === "agent" ? payload.title : run.activeAgent,
             }));
+          if (eventName === "timing")
+            updateRun(runId, (run) => ({ ...run, timing: payload }));
           if (eventName === "token")
             updateRun(runId, (run) => ({
               ...run,
@@ -672,6 +714,8 @@ function App() {
                   return (
                     <article className={`message ${message.role}`} key={message.id}>
                       {message.role === "assistant" && <div className="message-role">Agent</div>}
+                      {item.trace && <AgentRunTrace run={item.trace} taskId={selected.id}
+                        onRetry={(content) => void sendMessage(undefined, content)} />}
                       {stageRun && <StageRunTrace run={stageRun} task={selected} />}
                       {message.role === "assistant" ? (
                         <MarkdownContent content={message.content} taskId={selected.id} />
@@ -1023,7 +1067,39 @@ function StageRunTrace({ run, task }: { run: StageRun; task: Task }) {
   );
 }
 
-function RunOutput({ run, taskId, onRetry }: { run: Run; taskId: string; onRetry: (content: string) => void }) {
+function formatDuration(milliseconds: number) {
+  return milliseconds < 1000 ? `${milliseconds} ms` : `${(milliseconds / 1000).toFixed(1)} s`;
+}
+
+function TimingSummary({ timing }: { timing: RunTiming }) {
+  const metricLabels: Record<string, string> = {
+    model_ms: "模型响应",
+    tool_ms: "工具调用",
+    operation_wait_ms: "等待命令或补丁",
+    approval_wait_ms: "等待确认",
+  };
+  const entries = Object.entries(timing.agents).flatMap(([agent, metrics]) =>
+    Object.entries(metrics).map(([metric, elapsed]) => ({ agent, metric, elapsed })),
+  );
+  return (
+    <section className="timing-summary" aria-label="本轮 Agent 耗时">
+      <p><strong>本轮耗时</strong><span>{formatDuration(timing.total_ms)}</span></p>
+      {entries.map(({ agent, metric, elapsed }) => (
+        <p key={`${agent}-${metric}`}>
+          <span>{agent} / {metricLabels[metric] ?? metric}</span>
+          <strong>{formatDuration(elapsed)}</strong>
+        </p>
+      ))}
+    </section>
+  );
+}
+
+function AgentRunTrace({ run, taskId, onRetry, open = false }: {
+  run: Run;
+  taskId: string;
+  onRetry: (content: string) => void;
+  open?: boolean;
+}) {
   const icon = (kind: string) =>
     kind === "network" ? (
       <Globe2 size={14} />
@@ -1033,14 +1109,15 @@ function RunOutput({ run, taskId, onRetry }: { run: Run; taskId: string; onRetry
       <CircleDot size={14} />
     );
   return (
-    <article className={`message assistant streamed ${!run.complete ? "working" : ""}`}>
+    <>
       {!run.complete && <span className="agent-working-spinner" aria-label="Agent 正在工作" />}
-      <details className="activity-trace" open={!run.complete}>
+      <details className="activity-trace" open={open}>
         <summary>
           <Activity size={15} /> {run.complete ? (run.title ?? "工作过程") : (run.title ?? "Agent 正在工作")}
         </summary>
         <div>
           {run.workflow && <AgentFlow decision={run.workflow} activeAgent={run.activeAgent} />}
+          {run.timing && <TimingSummary timing={run.timing} />}
           {run.activities.map((item, index) => (
             <p
               className={`activity ${item.kind}`}
@@ -1070,9 +1147,7 @@ function RunOutput({ run, taskId, onRetry }: { run: Run; taskId: string; onRetry
             </button>
           )}
         </>
-      ) : (
-        run.content && run.stages.length === 0 && <MarkdownContent content={run.content} taskId={taskId} />
-      )}
+      ) : null}
       {run.files.length > 0 && (
         <div className="changed-files">
           <span>更改的文件</span>
@@ -1088,6 +1163,15 @@ function RunOutput({ run, taskId, onRetry }: { run: Run; taskId: string; onRetry
           ))}
         </div>
       )}
+    </>
+  );
+}
+
+function RunOutput({ run, taskId, onRetry }: { run: Run; taskId: string; onRetry: (content: string) => void }) {
+  return (
+    <article className={`message assistant streamed ${!run.complete ? "working" : ""}`}>
+      <AgentRunTrace run={run} taskId={taskId} onRetry={onRetry} open={!run.complete} />
+      {!run.error && run.content && run.stages.length === 0 && <MarkdownContent content={run.content} taskId={taskId} />}
     </article>
   );
 }

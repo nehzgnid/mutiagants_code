@@ -86,6 +86,45 @@ def test_workspace_write_tools_cannot_escape_the_task_directory(tmp_path: Path) 
         assert "only allows paths inside" in str(error)
 
 
+def test_read_file_returns_a_bounded_range_and_hash(tmp_path: Path) -> None:
+    repo = tmp_path / "read-range-repo"
+    repo.mkdir()
+    source = "".join(f"line {index}\n" for index in range(1, 701))
+    (repo / "sample.txt").write_text(source, encoding="utf-8")
+    task = Task(worktree_path=str(repo), permission_mode="read-only")
+
+    result = json.loads(main.read_local_file(task, {"path": "sample.txt", "start_line": 20, "end_line": 25}))
+
+    assert result["start_line"] == 20
+    assert result["end_line"] == 25
+    assert result["content"] == "".join(f"line {index}\n" for index in range(20, 26))
+    assert result["sha256"] == main.file_digest(source)
+    assert result["truncated"] is True
+
+
+def test_continuous_working_context_compacts_old_tool_output() -> None:
+    messages: list[dict] = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "goal " + "x" * 20_000},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "old", "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "old", "content": json.dumps({"content": "a" * 12_000})},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "recent", "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "recent", "content": json.dumps({"content": "b" * 12_000})},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "latest", "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "latest", "content": json.dumps({"content": "c" * 12_000})},
+    ]
+
+    compacted = main.compact_continuous_messages(messages)
+
+    assert any(message.get("content", "").startswith("Working-state summary") for message in compacted)
+    assert any(message.get("tool_call_id") == "recent" for message in compacted)
+    assert any(message.get("tool_call_id") == "latest" for message in compacted)
+    assert not any(message.get("tool_call_id") == "old" for message in compacted)
+    recent_result = next(message["content"] for message in compacted if message.get("tool_call_id") == "recent")
+    assert len(recent_result) <= main.CONTINUOUS_TOOL_RESULT_MAX_CHARS + 100
+    assert main.CONTINUOUS_TOOL_LOOP_LIMIT == 3
+
+
 def test_local_write_tool_rejects_non_writable_workflow_stages(tmp_path: Path) -> None:
     repo = tmp_path / "acceptance-repo"
     repo.mkdir()
@@ -190,6 +229,7 @@ def test_streamed_conversation_emits_activity_tokens_and_completion(monkeypatch,
         assert "event: run" in response.text
         assert "event: activity" in response.text
         assert "等待模型响应" in response.text
+        assert "event: timing" in response.text
         assert "event: token" in response.text
         assert "streamed answer" in response.text
         assert "event: done" in response.text
@@ -198,6 +238,9 @@ def test_streamed_conversation_emits_activity_tokens_and_completion(monkeypatch,
         patch_tool = next(tool["function"] for tool in captured_stream_requests[-1]["tools"] if tool["function"]["name"] == "apply_patch")
         assert "do not replace the whole file" in patch_tool["description"]
         assert "old_text=null only to create a brand-new file" in patch_tool["description"]
+        timed_run = client.get(f"/api/tasks/{task['id']}/agent-runs").json()[0]
+        assert timed_run["result"]["timing"]["total_ms"] >= 0
+        assert timed_run["result"]["timing"]["agents"]["Main Agent"]["model_ms"] >= 0
 
         class ToolResponse:
             def __init__(self, lines: list[str]): self.lines = lines
@@ -221,26 +264,115 @@ def test_streamed_conversation_emits_activity_tokens_and_completion(monkeypatch,
         assert tool_reply.status_code == 200
         assert "list_files" in tool_reply.text
         assert "event: activity" in tool_reply.text
+        assert "阅读 Agent" in tool_reply.text
         assert "正在执行 list_files" in tool_reply.text
         assert "tool result" in tool_reply.text
         assert "event: done" in tool_reply.text
+        timed_tool_run = client.get(f"/api/tasks/{task['id']}/agent-runs").json()[0]
+        assert timed_tool_run["result"]["timing"]["agents"]["阅读 Agent"]["tool_ms"] >= 0
 
         class BrokenStream:
             def __enter__(self): raise main.httpx.ConnectError("connection refused")
             def __exit__(self, *args): return None
 
-        delays: list[int] = []
-        monkeypatch.setattr(main.httpx, "stream", lambda *args, **kwargs: BrokenStream())
+        recovery_streams = iter([BrokenStream(), StreamResponse()])
+        recovery_delays: list[float] = []
+        monkeypatch.setattr(main.httpx, "stream", lambda *args, **kwargs: next(recovery_streams))
+        monkeypatch.setattr(main.time, "sleep", lambda seconds: recovery_delays.append(seconds))
+        recovered = client.post(f"/api/tasks/{task['id']}/messages/stream", json={"content": "recover stream"})
+        assert recovered.status_code == 200
+        assert "模型连接中断，正在重新连接" in recovered.text
+        assert "streamed answer" in recovered.text
+        assert "event: done" in recovered.text
+        assert recovery_delays == [main.MODEL_STREAM_RETRY_DELAY_SECONDS]
+
+        delays: list[float] = []
+        attempts = 0
+        def broken_stream(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            return BrokenStream()
+        monkeypatch.setattr(main.httpx, "stream", broken_stream)
         monkeypatch.setattr(main.time, "sleep", lambda seconds: delays.append(seconds))
         failed = client.post(f"/api/tasks/{task['id']}/messages/stream", json={"content": "retry stream"})
         assert failed.status_code == 200
         assert "event: error" in failed.text
         assert "connection refused" in failed.text
-        assert delays == []
+        assert attempts == main.MODEL_STREAM_MAX_ATTEMPTS
+        assert delays == [main.MODEL_STREAM_RETRY_DELAY_SECONDS]
         agent_runs = client.get(f"/api/tasks/{task['id']}/agent-runs").json()
         failed_run = next(run for run in agent_runs if run["status"] == "failed")
         assert failed_run["result"]["error"]
         assert failed_run["result"]["activities"]
+    finally:
+        remove_provider(provider["id"])
+        if original_provider_id:
+            client.post(f"/api/model-providers/{original_provider_id}/activate")
+        remove_workspace_by_path(repo)
+
+
+def test_continuous_tool_activity_reports_agent_roles(tmp_path: Path) -> None:
+    repo = tmp_path / "tool-activity-repo"
+    init_clean_repo(repo)
+    task = Task(id=str(uuid.uuid4()), title="tool activity", worktree_path=str(repo), permission_mode="full-access")
+    with SessionLocal() as db:
+        assert main.continuous_tool_activity(db, task, "list_files") == {
+            "kind": "tool", "title": "阅读 Agent", "detail": "正在执行 list_files"
+        }
+        assert main.continuous_tool_activity(db, task, "apply_patch") == {
+            "kind": "tool", "title": "执行 Agent", "detail": "正在执行 apply_patch"
+        }
+        assert main.continuous_tool_activity(db, task, "custom_tool") == {
+            "kind": "tool", "title": "工具 Agent", "detail": "正在执行 custom_tool"
+        }
+
+
+def test_continuous_run_summarizes_instead_of_failing_at_tool_limit(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "tool-limit-repo"
+    init_clean_repo(repo)
+    original_provider_id = active_provider_id()
+    provider = client.post("/api/model-providers", json={
+        "name": f"tool-limit-{uuid.uuid4().hex}", "kind": "external", "base_url": "https://example.test/v1", "model_name": "test-model",
+    }).json()
+    client.post(f"/api/model-providers/{provider['id']}/activate")
+
+    class ToolResponse:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def raise_for_status(self) -> None: pass
+        def iter_lines(self):
+            return iter([
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"list_files","arguments":"{\\\"path\\\":\\\".\\\"}"}}]},"finish_reason":"tool_calls"}]}',
+                "data: [DONE]",
+            ])
+
+    class SummaryResponse:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def raise_for_status(self) -> None: pass
+        def iter_lines(self):
+            return iter([
+                'data: {"choices":[{"delta":{"content":"本轮工具预算已用完，可以继续处理。"},"finish_reason":"stop"}]}',
+                "data: [DONE]",
+            ])
+
+    captured_requests: list[dict] = []
+    streams = iter([ToolResponse(), SummaryResponse()])
+    monkeypatch.setattr(main, "CONTINUOUS_TOOL_LOOP_LIMIT", 1)
+    monkeypatch.setattr(main.httpx, "stream", lambda *args, **kwargs: (captured_requests.append(kwargs["json"]) or next(streams)))
+    task = client.post("/api/tasks", json={"source_type": "local", "local_path": str(repo), "title": f"tool-limit-{uuid.uuid4().hex}"}).json()
+    try:
+        response = client.post(f"/api/tasks/{task['id']}/messages/stream", json={"content": "inspect until limit"})
+        assert response.status_code == 200
+        assert "event: error" not in response.text
+        assert "event: done" in response.text
+        assert "整理阶段结果" in response.text
+        assert "本轮工具预算已用完" in response.text
+        assert "tools" not in captured_requests[-1]
+        current = client.get(f"/api/tasks/{task['id']}").json()
+        assert current["status"] == "awaiting_input"
+        agent_run = client.get(f"/api/tasks/{task['id']}/agent-runs").json()[0]
+        assert agent_run["status"] == "completed"
     finally:
         remove_provider(provider["id"])
         if original_provider_id:
@@ -287,6 +419,7 @@ def test_continuous_run_completes_without_creating_stage_records(monkeypatch, tm
         agent_run = client.get(f"/api/tasks/{task['id']}/agent-runs").json()[0]
         assert agent_run["status"] == "completed"
         assert agent_run["result"]["content"] == "stage complete"
+        assert agent_run["result"]["message_id"] == history[-1]["id"]
     finally:
         remove_provider(provider["id"])
         if original_provider_id:

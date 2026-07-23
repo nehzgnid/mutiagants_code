@@ -29,6 +29,17 @@ def test_completed_streaming_run_is_restored_after_history_refresh() -> None:
     assert "setRuns(restoreAgentRuns(agentRuns));" in source
 
 
+def test_completed_run_trace_is_attached_to_its_persisted_agent_reply() -> None:
+    source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+
+    assert "function runMatchesMessage" in source
+    assert "run.messageId === message.id" in source
+    assert "const attachedRunIds = new Set<string>();" in source
+    assert "runs.filter((run) => !attachedRunIds.has(run.id))" in source
+    assert "{item.trace && <AgentRunTrace" in source
+    assert "function AgentRunTrace" in source
+
+
 def test_frontend_does_not_render_a_workflow_write_status() -> None:
     source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
     styles = (Path(__file__).parents[2] / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
@@ -86,7 +97,16 @@ def test_failed_agent_runs_are_restored_after_a_refresh() -> None:
 
     assert "function restoreAgentRuns" in source
     assert 'api<AgentRun[]>(`/api/tasks/${selected.id}/agent-runs`)' in source
-    assert '.filter((run) => run.status !== "completed" || (run.result.stages?.length ?? 0) > 0)' in source
+    assert '.filter((run) => run.status !== "completed" || hasVisibleRunResult(run))' in source
+
+
+def test_completed_continuous_runs_with_timing_are_restored_after_a_refresh() -> None:
+    source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+
+    assert "function hasVisibleRunResult" in source
+    assert "result.timing" in source
+    assert "(result.activities?.length ?? 0) > 0" in source
+    assert "(result.stages?.length ?? 0) > 0" in source
 
 
 def test_running_agent_run_shows_a_spinner_before_the_agent_bubble() -> None:
@@ -118,3 +138,15 @@ def test_changed_files_are_deduplicated_for_streaming_and_restored_runs() -> Non
     assert "function dedupeChangedFiles(files: ChangedFile[]): ChangedFile[]" in source
     assert "files: dedupeChangedFiles(run.result.files ?? [])" in source
     assert "files: dedupeChangedFiles([...run.files, payload])" in source
+
+
+def test_agent_run_renders_persisted_timing_by_role_and_work_type() -> None:
+    source = (Path(__file__).parents[2] / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+    styles = (Path(__file__).parents[2] / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
+
+    assert "type RunTiming" in source
+    assert 'if (eventName === "timing")' in source
+    assert "function TimingSummary" in source
+    assert "operation_wait_ms" in source
+    assert "{run.timing && <TimingSummary timing={run.timing} />}" in source
+    assert ".timing-summary" in styles

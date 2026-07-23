@@ -24,7 +24,7 @@ def test_conversation_interleaves_messages_and_agent_runs_in_timestamp_order() -
 
     assert "type ConversationItem" in source
     assert "Date.parse(left.created_at) - Date.parse(right.created_at)" in source
-    assert "...runs.map((run) => ({ kind: \"run\" as const, created_at: run.created_at, run }))" in source
+    assert "...runs.filter((run) => !attachedRunIds.has(run.id)).map((run) => ({ kind: \"run\" as const, created_at: run.created_at, run }))" in source
 
 
 def test_automatic_workflow_does_not_start_a_second_client_stream() -> None:

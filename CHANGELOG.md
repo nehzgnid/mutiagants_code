@@ -2305,3 +2305,201 @@ Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, a
 - Added regression coverage for the continuous-run startup copy, model-wait activity, and streamed tool activity visibility.
 
 Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_message_labels.py backend\\tests\\test_task_conversation.py -q`, `npm --prefix frontend run build`, and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` passed.
+
+## 2026-07-23
+
+### Code
+
+- Requirements analysis: the continuous Main Agent loop still reported tool work mainly by function name, so the running card did not clearly show which Agent role was doing each visible action.
+- High-level design: keep the continuous single-run backend model, but classify user-visible activity titles by existing Agent role names so the work trace reads as role plus action.
+- Detailed design: add `continuous_tool_activity` for the continuous stream; report `list_files` and `read_file` as `阅读 Agent`, `apply_patch` and `run_command` as `执行 Agent`, unknown tools as `工具 Agent`, and model waiting as `Main Agent / 等待模型响应`.
+
+Verification: reviewed the continuous stream loop, legacy stream caller, and activity rendering contract before changing source.
+
+### Code Review
+
+- Confirmed the role labels are presentation metadata only and do not change tool permissions, execution order, or legacy staged workflow behavior.
+- Confirmed the legacy endpoint still uses `tool_activity_detail` unchanged, while the continuous endpoint uses the new role-aware wrapper.
+
+Verification: static review of `backend/app/main.py` and focused regression assertions.
+
+### Unit Testing
+
+- Added coverage for streamed read-tool role display and direct role classification for read, execution, and fallback tools.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py -q` and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` passed.
+
+## 2026-07-23
+
+### Code
+
+- Requirements analysis: long continuous Agent runs could exceed the local tool-loop cap and were shown as `Agent 运行失败` even though the work could be continued from the accumulated context.
+- High-level design: keep a bounded local loop to prevent runaway tool use, but turn budget exhaustion into a graceful handoff summary instead of a failed run.
+- Detailed design: replace the inline `range(12)` with `CONTINUOUS_TOOL_LOOP_LIMIT = 40`; when the limit is reached, stream `Main Agent / 整理阶段结果`, make one final no-tool model request for a concise progress summary, persist the assistant message, mark the run completed, and leave the task `awaiting_input` so the user can continue.
+
+Verification: reproduced the failing path from the continuous loop structure and reviewed task/run status handling before changing source.
+
+### Code Review
+
+- Confirmed genuine model/network/tool exceptions still go through the existing failed-run path.
+- Confirmed the final budget summary request removes `tools` and `tool_choice`, preventing another tool-call loop while preserving the accumulated conversation.
+- Confirmed the task remains continue-able rather than being marked completed when the local budget is exhausted.
+
+Verification: static review of `backend/app/main.py` and the focused regression test.
+
+### Unit Testing
+
+- Added a regression test that forces the loop limit to one, verifies no `event: error` is emitted, confirms a `done` summary is streamed, and checks the task remains `awaiting_input`.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py -q` and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py` passed.
+
+## 2026-07-23
+
+### Plan
+
+- Requirements analysis: one continuous conversation run is executed by a single Main Agent; the visible reading, execution, and tool Agent labels classify tool calls rather than represent separate processes. The user needs per-role observable duration data to identify slow runs.
+- High-level design: store a compact timing summary in the existing `AgentRun.result` JSON and reuse the current SSE stream and activity trace, avoiding a new table or additional orchestration stage.
+- Detailed design: measure end-to-end model stream time for Main Agent, direct tool invocation time for the classified tool role, asynchronous operation wait time, and approval wait time; record the complete run wall-clock duration separately and display all persisted values in the run trace.
+
+Verification: reviewed the continuous conversation loop, AgentRun persistence contract, existing tool-role labels, and frontend stream restoration paths.
+
+### Code
+
+- Added observable timing accumulation for continuous Agent runs and streamed `timing` updates that survive refresh through the existing AgentRun API.
+- Added a compact per-run timing summary showing total wall-clock duration and role/work-type entries for model response, tool execution, operation waiting, and approval waiting.
+- Added regression assertions for timing stream events, persisted Main Agent/model duration, persisted reading Agent/tool duration, and timing-summary rendering.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py backend\\tests\\test_task_conversation.py backend\\tests\\test_frontend_message_labels.py`, `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py backend\\tests\\test_frontend_message_labels.py -q`, `npm --prefix frontend run build`, and `git diff --check` passed.
+
+### Code Review
+
+- Confirmed the implementation measures externally observable wall-clock intervals only; it does not claim access to private model reasoning time.
+- Confirmed totals are calculated separately from nested sub-intervals, so model, tool, and wait rows are diagnostic breakdowns rather than a misleading summed total.
+- Confirmed SQLite timestamps that are restored without timezone metadata are normalized before total-duration calculation.
+
+Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, `frontend/src/styles.css`, and the focused regression tests.
+
+### Unit Testing
+
+- Ran the complete backend suite after the focused timing checks and frontend build.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 61 tests and one existing Starlette deprecation warning; `npm --prefix frontend run build` and `git diff --check` passed.
+
+## 2026-07-23
+
+### Code
+
+- Requirements analysis: completed continuous conversation runs can contain visible work trace data without legacy staged `stages`; the previous restore filter kept only completed runs with stages, so the collapsible Agent work-process card disappeared after refresh or task switching.
+- High-level design: keep the existing run trace UI and AgentRun API, but broaden frontend restoration to keep any completed run that has user-visible result data.
+- Detailed design: add `hasVisibleRunResult` and use it from `restoreAgentRuns`; preserve completed runs that include content, error, workflow, timing, activities, changed files, or stages.
+
+Verification: reviewed the frontend timeline assembly, run restoration path, and timing/work-trace rendering contract before changing source.
+
+### Code Review
+
+- Confirmed the change only affects whether persisted completed runs are shown in history; it does not alter message content, streaming behavior, backend persistence, or task execution.
+- Confirmed empty completed runs remain hidden, avoiding stale blank trace cards.
+
+Verification: static review of `frontend/src/main.tsx` and focused regression assertions.
+
+### Unit Testing
+
+- Added coverage that completed continuous runs with timing/activity data are considered restorable after a refresh.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_frontend_message_labels.py -q` and `npm --prefix frontend run build` passed.
+
+## 2026-07-23
+
+### Plan
+
+- Requirements analysis: a continuous run made one remote model request for each small tool step, retained every raw tool result in subsequent requests, and permitted 40 serial rounds. The measured 228.9-second run used about 34 model requests, so local tool speed could not materially improve end-to-end latency.
+- High-level design: define a three-round fast path for ordinary coding tasks, preserve complete tool conversations only for audit, and send the model a bounded rolling working context.
+- Detailed design: limit continuous runs to three tool-decision rounds; instruct the model to batch independent reads and related edits; keep the last two tool protocol turns; replace older turns with a local summary; limit directory output and range-based file reads; include the source hash in read results for patch preconditions.
+
+Verification: reviewed the continuous stream loop, tool schemas, patch hash contract, existing timing records, and focused conversation tests before changing source.
+
+### Code
+
+- Reduced `CONTINUOUS_TOOL_LOOP_LIMIT` from 40 to 3 for the continuous fast path; budget exhaustion continues through the existing concise handoff rather than failing the task.
+- Added bounded rolling model context and separate full audit history in `AgentRun.result.conversation`, preventing long raw tool outputs from being resent indefinitely while preserving recovery and inspection data.
+- Changed local file listing to 120 entries and file reading to a default 400-line, maximum 2,000-line/24,000-character range with `start_line`, `end_line`, `total_lines`, and `sha256` metadata.
+- Updated the continuous-agent instruction to request batched independent reads and grouped edits with dependent verification commands.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py`, `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py backend\\tests\\test_execution_operations.py -q`, `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q`, `npm --prefix frontend run build`, and `git diff --check` passed.
+
+### Code Review
+
+- Confirmed prompt compaction retains the latest two assistant tool-call/message-result groups, so the provider receives valid tool-call protocol state.
+- Confirmed raw tool output is appended to the audit copy before prompt compaction and is used for approval pauses and completed-run persistence.
+- Confirmed the change is scoped to the continuous endpoint; legacy staged workflow behavior, permissions, patch approval, and command execution order are unchanged.
+
+Verification: static review of `backend/app/main.py` and the new regression coverage.
+
+### Unit Testing
+
+- Added tests for bounded range reads with content hashes and for compaction that drops older tool results while retaining the two newest tool rounds.
+
+Verification: backend suite passed with 64 tests and one existing Starlette deprecation warning; frontend production build and diff whitespace validation passed.
+
+## 2026-07-23
+
+### Plan
+
+- Requirements analysis: the continuous Main Agent treated a TLS stream closed before any model output as a terminal task failure. The reported `EOF occurred in violation of protocol` is an `httpx.TransportError` class of transient network failure, and the request has not yet caused a local tool side effect.
+- High-level design: retry a continuous model request once only when no text or tool-call delta has been received; preserve the failed-run path for partial streams and repeated failures so no response or tool action is replayed.
+- Detailed design: use two maximum attempts with a 0.5-second reconnect delay for normal and tool-budget-summary streams; publish a reconnect activity event, then wrap final failures in a stable model-stream error.
+
+Verification: reviewed the continuous streaming loop, `httpx.TransportError` boundary, tool side-effect timing, and existing stream regression coverage.
+
+### Code
+
+- Added a bounded first-byte retry for continuous Main Agent and final-summary model streams, recovering a transient TLS EOF without extending healthy requests or rerunning emitted tool calls.
+- Added a visible reconnect activity event and stable error message after the retry budget is exhausted.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py -q`, `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py`, and `git diff --check` passed.
+
+### Code Review
+
+- Confirmed retries occur before a response token or tool-call delta is accepted, so repeating the HTTP request cannot duplicate model output in the UI or execute a local tool twice.
+- Confirmed the delay is 0.5 seconds and only applies to a failed attempt, preserving the 20-30 second target for healthy runs.
+
+Verification: static review of `backend/app/main.py`.
+
+### Unit Testing
+
+- Added regressions for a first-attempt transport failure followed by a successful model stream, and for exactly two failed attempts with one reconnect delay before the failed-run record is persisted.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests\\test_task_conversation.py -q` passed with 10 tests and one existing Starlette deprecation warning.
+
+## 2026-07-23
+
+### Plan
+
+- Requirements analysis: one completed continuous Agent run persisted the final reply both as the formal conversation message and as `AgentRun.result.content`. The timeline rendered both objects separately, duplicating the reply while leaving the run card as the only place for the workflow trace.
+- High-level design: retain both persisted records for auditability and recovery, but attach each completed run's full trace to its corresponding formal Agent reply and omit that run from the standalone timeline entries.
+- Detailed design: persist the formal reply ID as `AgentRun.result.message_id`; match it in the frontend, with a content-match fallback for older records; reuse the run-trace view inside the formal message, preserving workflow routing, activities, stage output, timing, changed files, retry handling, and all active or failed standalone runs.
+
+Verification: reviewed the continuous completion persistence, history refresh flow, timeline ordering, and current trace rendering before implementation.
+
+### Code
+
+- Stored each continuous run's final `message_id` in its existing result JSON alongside the final content.
+- Associated completed successful runs with their formal Agent messages in the frontend and rendered the existing work trace inside that message instead of showing a second card with duplicate content.
+- Kept standalone cards for runs that are active, failed, unmatched, or not yet associated with a formal reply; legacy persisted runs without a message ID fall back to content matching.
+
+Verification: frontend TypeScript production build and Python compilation completed successfully.
+
+### Code Review
+
+- Confirmed a trace is attached only once and only for a successful completed run with a persisted assistant reply, so an active or failed workflow remains visible and actionable.
+- Confirmed the embedded view reuses the full trace: workflow flow, activity log, per-role timing, stage output, changed files, and retry state are retained rather than simplified or discarded.
+- Confirmed the formal message timestamp remains the ordering point once its trace is attached, avoiding a duplicate timeline entry.
+
+Verification: static review of `backend/app/main.py`, `frontend/src/main.tsx`, and the updated frontend/backend regression tests.
+
+### Unit Testing
+
+- Added coverage that the backend records the final message ID in the completed run and that the frontend associates the run trace with that Agent message while filtering the duplicate standalone run entry.
+- Updated the timeline-structure regression to account for attached runs being excluded from the standalone run list.
+
+Verification: `.\\.venv\\Scripts\\python.exe -m pytest backend\\tests -q` passed with 65 tests and one existing Starlette deprecation warning; `npm --prefix frontend run build` and `.\\.venv\\Scripts\\python.exe -m py_compile backend\\app\\main.py backend\\tests\\test_task_conversation.py backend\\tests\\test_frontend_message_labels.py backend\\tests\\test_frontend_conversation_viewport.py` passed.

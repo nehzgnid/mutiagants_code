@@ -35,6 +35,17 @@ DATA_DIR.mkdir(exist_ok=True)
 DATABASE_URL = f"sqlite:///{(DATA_DIR / 'workbench.db').as_posix()}"
 EXECUTOR_IMAGE = os.getenv("EXECUTOR_IMAGE", "local-agent-python:3.12")
 SECRETS_PATH = DATA_DIR / "model-secrets.json"
+# A fast coding turn should normally inspect, edit/verify, then finish.  Further
+# exploration is still available by continuing the task after the handoff.
+CONTINUOUS_TOOL_LOOP_LIMIT = 3
+CONTINUOUS_WORKING_CONTEXT_MAX_CHARS = 28_000
+CONTINUOUS_TOOL_RESULT_MAX_CHARS = 6_000
+MODEL_STREAM_MAX_ATTEMPTS = 2
+MODEL_STREAM_RETRY_DELAY_SECONDS = 0.5
+FILE_LIST_MAX_ENTRIES = 120
+FILE_READ_DEFAULT_LINES = 400
+FILE_READ_MAX_LINES = 2_000
+FILE_READ_MAX_CHARS = 24_000
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
@@ -735,6 +746,30 @@ def update_agent_run(run_id: str, task_id: str, *, activity: dict[str, Any] | No
         db.commit()
 
 
+def record_agent_run_timing(run_id: str, agent: str | None = None, metric: str | None = None,
+                            elapsed_ms: float = 0) -> dict[str, Any]:
+    """Accumulate observable wall-clock timings without storing model reasoning content."""
+    with SessionLocal() as db:
+        run = db.get(AgentRun, run_id)
+        if not run:
+            return {}
+        result = dict(run.result or {})
+        timing = dict(result.get("timing") or {})
+        timing.setdefault("started_at", run.created_at.isoformat())
+        started_at = run.created_at.replace(tzinfo=timezone.utc) if run.created_at.tzinfo is None else run.created_at
+        timing["total_ms"] = max(0, round((now() - started_at).total_seconds() * 1000))
+        agents = dict(timing.get("agents") or {})
+        if agent and metric:
+            agent_timing = dict(agents.get(agent) or {})
+            agent_timing[metric] = round(float(agent_timing.get(metric, 0)) + elapsed_ms)
+            agents[agent] = agent_timing
+        timing["agents"] = agents
+        result["timing"] = timing
+        run.result, run.updated_at = result, now()
+        db.commit()
+        return timing
+
+
 def save_agent_run_context(run_id: str, task_id: str, messages: list[dict[str, Any]], waiting_operation_id: str | None = None) -> None:
     """Persist the tool conversation needed to explain or resume a paused run."""
     with SessionLocal() as db:
@@ -908,9 +943,9 @@ def list_local_files(task: Task, arguments: dict[str, Any]) -> str:
         if excluded.intersection(path.parts) or not path.is_file():
             continue
         files.append(str(path.relative_to(target)))
-        if len(files) == 300:
+        if len(files) == FILE_LIST_MAX_ENTRIES:
             break
-    return json.dumps({"path": str(target), "files": files, "truncated": len(files) == 300}, ensure_ascii=False)
+    return json.dumps({"path": str(target), "files": files, "truncated": len(files) == FILE_LIST_MAX_ENTRIES}, ensure_ascii=False)
 
 
 def read_local_file(task: Task, arguments: dict[str, Any]) -> str:
@@ -918,7 +953,65 @@ def read_local_file(task: Task, arguments: dict[str, Any]) -> str:
     if not target.is_file():
         raise ValueError("The requested path is not a file.")
     content = target.read_text(encoding="utf-8", errors="replace")
-    return json.dumps({"path": str(target), "content": content[:100_000], "truncated": len(content) > 100_000}, ensure_ascii=False)
+    lines = content.splitlines(keepends=True)
+    start_line = max(1, int(arguments.get("start_line", 1)))
+    requested_end = int(arguments.get("end_line", start_line + FILE_READ_DEFAULT_LINES - 1))
+    end_line = min(len(lines), max(start_line, min(requested_end, start_line + FILE_READ_MAX_LINES - 1)))
+    selected = "".join(lines[start_line - 1:end_line])
+    if len(selected) > FILE_READ_MAX_CHARS:
+        selected = selected[:FILE_READ_MAX_CHARS]
+        truncated = True
+    else:
+        truncated = end_line < len(lines)
+    return json.dumps({
+        "path": str(target), "sha256": file_digest(content), "start_line": start_line,
+        "end_line": end_line, "total_lines": len(lines), "content": selected, "truncated": truncated,
+    }, ensure_ascii=False)
+
+
+def compact_tool_result(content: str) -> str:
+    """Bound tool output sent back to the model; the full output remains in AgentRun."""
+    if len(content) <= CONTINUOUS_TOOL_RESULT_MAX_CHARS:
+        return content
+    try:
+        payload = json.loads(content)
+        if isinstance(payload, dict) and isinstance(payload.get("content"), str):
+            payload = dict(payload)
+            payload["content"] = payload["content"][:CONTINUOUS_TOOL_RESULT_MAX_CHARS]
+            payload["truncated"] = True
+            return json.dumps(payload, ensure_ascii=False)
+    except json.JSONDecodeError:
+        pass
+    return content[:CONTINUOUS_TOOL_RESULT_MAX_CHARS] + "\n[Tool output truncated in working context.]"
+
+
+def compact_continuous_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep recent tool protocol intact while replacing older turns with local state."""
+    copied = [{**message} for message in messages]
+    for message in copied:
+        if message.get("role") == "tool" and isinstance(message.get("content"), str):
+            message["content"] = compact_tool_result(message["content"])
+    if sum(len(str(message.get("content") or "")) for message in copied) <= CONTINUOUS_WORKING_CONTEXT_MAX_CHARS:
+        return copied
+
+    prefix_end = next((index for index, message in enumerate(copied) if message.get("role") != "system"), len(copied))
+    tool_turns = [index for index, message in enumerate(copied) if message.get("role") == "assistant" and message.get("tool_calls")]
+    keep_start = tool_turns[-2] if len(tool_turns) >= 2 else max(prefix_end, len(copied) - 4)
+    prior = copied[prefix_end:keep_start]
+    state: list[str] = []
+    for message in prior:
+        role, content = str(message.get("role", "unknown")), str(message.get("content") or "")
+        if role == "assistant" and message.get("tool_calls"):
+            names = ", ".join(str(call.get("function", {}).get("name", "tool")) for call in message["tool_calls"])
+            state.append(f"assistant called: {names}")
+        elif content:
+            state.append(f"{role}: {content[:1_000]}")
+    summary = "\n".join(state)[-6_000:] or "Earlier working turns were compacted locally."
+    return [
+        *copied[:prefix_end],
+        {"role": "system", "content": f"Working-state summary from earlier turns:\n{summary}"},
+        *copied[keep_start:],
+    ]
 
 
 def apply_local_patch(task: Task, arguments: dict[str, Any], db: Session) -> str:
@@ -946,8 +1039,8 @@ def apply_local_patch(task: Task, arguments: dict[str, Any], db: Session) -> str
 
 
 BASE_TOOLS = [
-    {"type": "function", "function": {"name": "list_files", "description": "List files below an authorized local directory.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path or path relative to the task code directory."}}, "required": []}}},
-    {"type": "function", "function": {"name": "read_file", "description": "Read a UTF-8 text file from an authorized local path.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "list_files", "description": "List up to 120 files below an authorized local directory. Use a focused path when possible.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path or path relative to the task code directory."}}, "required": []}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read a UTF-8 text file range and return its SHA-256 hash. Defaults to 400 lines; request a focused range before expanding.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1}}, "required": ["path"]}}},
 ]
 PATCH_TOOL = {"type": "function", "function": {"name": "apply_patch", "description": "Atomically apply precise text edits. For existing files, always use small exact old_text/new_text replacements like a diff; do not replace the whole file. Use old_text=null only to create a brand-new file that does not already exist. Read files first and supply their SHA-256 content hash as expected_hash. In manual confirmation mode the patch waits for user approval.", "parameters": {"type": "object", "properties": {"edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "expected_hash": {"type": ["string", "null"], "description": "SHA-256 hash of the file content read before editing. Required for existing files."}, "old_text": {"type": ["string", "null"], "description": "Existing files: exact text snippet to replace. New files only: null."}, "new_text": {"type": "string", "description": "Replacement text for old_text, or complete content only when creating a new file."}}, "required": ["path", "expected_hash", "old_text", "new_text"]}}}, "required": ["edits"]}}}
 COMMAND_TOOL = {"type": "function", "function": {"name": "run_command", "description": "Start a local command with streamed output. Available only after the user selected full access.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "working_directory": {"type": "string"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800}}, "required": ["command"]}}}
@@ -1051,6 +1144,16 @@ def tool_activity_detail(db: Session, task: Task, function_name: str) -> str:
             if mcp_function_name(server, str(tool.get("name", ""))) == function_name:
                 return f"正在调用 MCP Server {server.name} 的 {tool.get('name')}"
     return f"正在执行 {function_name}"
+
+
+def continuous_tool_activity(db: Session, task: Task, function_name: str) -> dict[str, str]:
+    agent_by_tool = {
+        "list_files": "阅读 Agent",
+        "read_file": "阅读 Agent",
+        "apply_patch": "执行 Agent",
+        "run_command": "执行 Agent",
+    }
+    return {"kind": "tool", "title": agent_by_tool.get(function_name, "工具 Agent"), "detail": tool_activity_detail(db, task, function_name)}
 
 
 class TaskInput(BaseModel):
@@ -1702,7 +1805,7 @@ def sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def conversation_request(db: Session, task: Task, provider: ModelProvider, history: list[dict[str, str]], continuous: bool = False) -> tuple[dict[str, Any], dict[str, str]]:
+def conversation_request(db: Session, task: Task, provider: ModelProvider, history: list[dict[str, Any]], continuous: bool = False) -> tuple[dict[str, Any], dict[str, str]]:
     permission_descriptions = {
         "read-only": "Read-only: inspect files only inside the task code directory; never modify files or run commands.",
         "workspace-write": "Workspace write: read and modify files only inside the task code directory; do not run commands.",
@@ -1715,6 +1818,8 @@ def conversation_request(db: Session, task: Task, provider: ModelProvider, histo
         "Use supplied tools before making claims about repository contents. The UI records tool activity separately, so the final "
         "answer must only report the completed result, verification, and genuine blockers; do not expose chain-of-thought. "
         "Use concise GitHub-Flavored Markdown and do not paste full changed source files. "
+        "For a coding task, batch independent reads or searches in one tool response. After inspection, combine related edits in one "
+        "apply_patch call and, when safe, place dependent verification commands after it in the same tool response. "
         f"Task title: {task.title}; task requirement: {task.requirement}; code directory: {task.worktree_path or 'not bound'}. "
         "When editing existing files, use precise small old_text/new_text replacements; never use old_text=null or whole-file replacement for existing files. "
         "When a patch requires user approval, wait for its tool result before deciding what to do next. "
@@ -1727,7 +1832,7 @@ def conversation_request(db: Session, task: Task, provider: ModelProvider, histo
         "messages": [
             {"role": "system", "content": system_message},
             *([{"role": "system", "content": f"Compressed earlier conversation:\n{task.context_summary}"}] if task.context_summary else []),
-            *history,
+            *(compact_continuous_messages(history) if continuous else history),
         ],
         "tools": tools_for_task(task, db, continuous=continuous), "tool_choice": "auto", "stream": True,
     }, {"Authorization": f"Bearer {read_secrets().get(snapshot['id'], '')}"}
@@ -1920,7 +2025,10 @@ def stream_continuous_task_message(task_id: str, payload: MessageInput) -> Strea
         db.add(TaskMessage(id=str(uuid.uuid4()), task_id=task_id, role="user", content=content, created_at=now()))
         task.status, task.current_stage, task.assigned_agent = "in_progress", "continuous_run", "Main Agent"
         task.workflow_type, task.task_kind, task.routing_decision, task.updated_at = "continuous", "development", None, now()
-        run = AgentRun(id=str(uuid.uuid4()), task_id=task_id, status="running", created_at=now(), updated_at=now())
+        run_created_at = now()
+        run = AgentRun(id=str(uuid.uuid4()), task_id=task_id, status="running", result={
+            "timing": {"started_at": run_created_at.isoformat(), "total_ms": 0, "agents": {}},
+        }, created_at=run_created_at, updated_at=run_created_at)
         db.add(run); db.commit()
         history = [{"role": message.role, "content": message.content} for message in db.scalars(
             select(TaskMessage).where(TaskMessage.task_id == task_id, TaskMessage.context_compacted.is_(False)).order_by(TaskMessage.created_at, TaskMessage.id)
@@ -1929,20 +2037,101 @@ def stream_continuous_task_message(task_id: str, payload: MessageInput) -> Strea
         provider_url, run_id = api_root(provider.base_url), run.id
 
     def event_stream():
-        def wait_for_operation(operation_id: str):
+        # Audit history is complete; request_body carries only the bounded working context.
+        audit_messages = list(request_body["messages"])
+
+        def publish_timing(agent: str | None = None, metric: str | None = None, started_at: float | None = None):
+            elapsed_ms = (time.perf_counter() - started_at) * 1000 if started_at is not None else 0
+            timing = record_agent_run_timing(run_id, agent, metric, elapsed_ms)
+            yield sse("timing", timing)
+
+        def complete_run(answer: str, status: str = "completed", stage: str = COMPLETED_STAGE) -> TaskMessage:
+            with SessionLocal() as db:
+                task = db.get(Task, task_id)
+                if task:
+                    task.status, task.current_stage = status, stage
+                message = TaskMessage(id=str(uuid.uuid4()), task_id=task_id, role="assistant", content=answer, created_at=now())
+                db.add(message)
+                stored = db.get(AgentRun, run_id)
+                if stored:
+                    stored.status = "completed"
+                    stored.result = {
+                        **(stored.result or {}),
+                        "content": answer,
+                        "message_id": message.id,
+                        "conversation": audit_messages,
+                    }
+                    stored.updated_at = now()
+                db.commit()
+                return message
+
+        def summarize_after_tool_limit() -> str:
+            activity = {"kind": "agent", "title": "Main Agent", "detail": "整理阶段结果"}
+            update_agent_run(run_id, task_id, activity=activity)
+            yield sse("activity", activity)
+            final_request = {key: value for key, value in request_body.items() if key not in {"tools", "tool_choice"}}
+            final_request["messages"] = [
+                *request_body["messages"],
+                {"role": "system", "content": (
+                    "The local continuous-run tool budget for this response has been reached. Do not call tools. "
+                    "Reply in Chinese with a concise status update: what was completed, what was changed or verified if known, "
+                    "and what the user can ask you to continue next. Do not claim unfinished work is complete."
+                )},
+            ]
+            answer = ""
+            model_started_at = time.perf_counter()
+            for attempt in range(MODEL_STREAM_MAX_ATTEMPTS):
+                try:
+                    with httpx.stream("POST", f"{provider_url}/chat/completions", json=final_request, headers=headers, timeout=120) as response:
+                        response.raise_for_status()
+                        for line in response.iter_lines():
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data = line.removeprefix("data:").strip()
+                            if data == "[DONE]":
+                                continue
+                            choices = (json.loads(data).get("choices") or [])
+                            if not choices:
+                                continue
+                            text = choices[0].get("delta", {}).get("content")
+                            if text:
+                                answer += text
+                                update_agent_run(run_id, task_id, token=text)
+                                yield sse("token", {"content": text})
+                    break
+                except httpx.TransportError as error:
+                    if answer or attempt + 1 == MODEL_STREAM_MAX_ATTEMPTS:
+                        raise ConnectionError(f"Model stream failed: {type(error).__name__}: {error}") from error
+                    activity = {"kind": "network", "title": "Main Agent", "detail": "模型连接中断，正在重新连接"}
+                    update_agent_run(run_id, task_id, activity=activity)
+                    yield sse("activity", activity)
+                    time.sleep(MODEL_STREAM_RETRY_DELAY_SECONDS)
+            yield from publish_timing("Main Agent", "model_ms", model_started_at)
+            if answer.strip():
+                return answer
+            return "本轮已达到本地工具调用上限。已保留当前工作记录，请继续发送指令让我接着处理。"
+
+        def wait_for_operation(operation_id: str, agent: str):
             announced = False
+            wait_started_at = time.perf_counter()
+            approval_started_at: float | None = None
             while True:
                 with SessionLocal() as operation_db:
                     operation = operation_db.get(ExecutionOperation, operation_id)
                     if not operation:
+                        yield from publish_timing(agent, "operation_wait_ms", wait_started_at)
                         return {"error": "Operation no longer exists"}
                     snapshot = operation_payload(operation)
                     if operation.status not in {"queued", "running", "pending_approval"}:
+                        yield from publish_timing(agent, "operation_wait_ms", wait_started_at)
+                        if approval_started_at is not None:
+                            yield from publish_timing("等待确认", "approval_wait_ms", approval_started_at)
                         return snapshot
                     if operation.status == "pending_approval" and not announced:
                         announced = True
+                        approval_started_at = time.perf_counter()
                         update_agent_run(run_id, task_id, status="awaiting_approval", activity={"kind": "pause", "title": "等待补丁确认", "detail": "确认后会自动继续"})
-                        save_agent_run_context(run_id, task_id, request_body["messages"], operation_id)
+                        save_agent_run_context(run_id, task_id, audit_messages, operation_id)
                         yield sse("pause", {"operation_id": operation_id, "reason": "approval_required"})
                 time.sleep(0.2)
 
@@ -1950,62 +2139,73 @@ def stream_continuous_task_message(task_id: str, payload: MessageInput) -> Strea
             yield sse("run", {"id": run_id, "status": "running"})
             update_agent_run(run_id, task_id, activity={"kind": "agent", "title": "Main Agent", "detail": "连续执行任务"})
             yield sse("activity", {"kind": "agent", "title": "Main Agent", "detail": "连续执行任务"})
-            for _ in range(12):
+            for _ in range(CONTINUOUS_TOOL_LOOP_LIMIT):
                 answer = ""
                 calls: dict[int, dict[str, Any]] = {}
-                activity = {"kind": "network", "title": "模型响应", "detail": "等待模型响应"}
+                activity = {"kind": "network", "title": "Main Agent", "detail": "等待模型响应"}
                 update_agent_run(run_id, task_id, activity=activity)
                 yield sse("activity", activity)
-                with httpx.stream("POST", f"{provider_url}/chat/completions", json=request_body, headers=headers, timeout=120) as response:
-                    response.raise_for_status()
-                    for line in response.iter_lines():
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data = line.removeprefix("data:").strip()
-                        if data == "[DONE]":
-                            continue
-                        choices = (json.loads(data).get("choices") or [])
-                        if not choices:
-                            continue
-                        delta = choices[0].get("delta", {})
-                        text = delta.get("content")
-                        if text:
-                            answer += text; update_agent_run(run_id, task_id, token=text); yield sse("token", {"content": text})
-                        for call in delta.get("tool_calls", []):
-                            index = call.get("index", 0)
-                            stored = calls.setdefault(index, {"id": call.get("id"), "function": {"name": "", "arguments": ""}})
-                            stored["id"] = call.get("id") or stored["id"]
-                            function = call.get("function", {})
-                            stored["function"]["name"] += function.get("name", "")
-                            stored["function"]["arguments"] += function.get("arguments", "")
+                model_started_at = time.perf_counter()
+                for attempt in range(MODEL_STREAM_MAX_ATTEMPTS):
+                    try:
+                        with httpx.stream("POST", f"{provider_url}/chat/completions", json=request_body, headers=headers, timeout=120) as response:
+                            response.raise_for_status()
+                            for line in response.iter_lines():
+                                if not line or not line.startswith("data:"):
+                                    continue
+                                data = line.removeprefix("data:").strip()
+                                if data == "[DONE]":
+                                    continue
+                                choices = (json.loads(data).get("choices") or [])
+                                if not choices:
+                                    continue
+                                delta = choices[0].get("delta", {})
+                                text = delta.get("content")
+                                if text:
+                                    answer += text; update_agent_run(run_id, task_id, token=text); yield sse("token", {"content": text})
+                                for call in delta.get("tool_calls", []):
+                                    index = call.get("index", 0)
+                                    stored = calls.setdefault(index, {"id": call.get("id"), "function": {"name": "", "arguments": ""}})
+                                    stored["id"] = call.get("id") or stored["id"]
+                                    function = call.get("function", {})
+                                    stored["function"]["name"] += function.get("name", "")
+                                    stored["function"]["arguments"] += function.get("arguments", "")
+                        break
+                    except httpx.TransportError as error:
+                        if answer or calls or attempt + 1 == MODEL_STREAM_MAX_ATTEMPTS:
+                            raise ConnectionError(f"Model stream failed: {type(error).__name__}: {error}") from error
+                        activity = {"kind": "network", "title": "Main Agent", "detail": "模型连接中断，正在重新连接"}
+                        update_agent_run(run_id, task_id, activity=activity)
+                        yield sse("activity", activity)
+                        time.sleep(MODEL_STREAM_RETRY_DELAY_SECONDS)
+                yield from publish_timing("Main Agent", "model_ms", model_started_at)
                 if not calls:
                     if not answer.strip():
                         raise ValueError("The model returned an empty response")
-                    with SessionLocal() as db:
-                        task = db.get(Task, task_id); task.status, task.current_stage = "completed", COMPLETED_STAGE
-                        message = TaskMessage(id=str(uuid.uuid4()), task_id=task_id, role="assistant", content=answer, created_at=now())
-                        db.add(message); stored = db.get(AgentRun, run_id)
-                        stored.status, stored.result, stored.updated_at = "completed", {**(stored.result or {}), "content": answer, "conversation": request_body["messages"]}, now()
-                        db.commit()
+                    message = complete_run(answer)
                     yield sse("done", {"message": dump_message(message)})
                     return
                 tool_calls = [calls[index] for index in sorted(calls)]
-                request_body["messages"].append({"role": "assistant", "content": None, "tool_calls": tool_calls})
+                assistant_tool_message = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+                request_body["messages"].append(assistant_tool_message)
+                audit_messages.append(assistant_tool_message)
                 for call in tool_calls:
                     name = call["function"]["name"]
                     try:
                         arguments = json.loads(call["function"]["arguments"] or "{}")
                         yield sse("tool_call", {"name": name, "arguments": arguments})
+                        tool_started_at = time.perf_counter()
                         with SessionLocal() as db:
                             current_task = db.get(Task, task_id)
-                            activity = {"kind": "tool", "title": name, "detail": tool_activity_detail(db, current_task, name)}
+                            activity = continuous_tool_activity(db, current_task, name)
                             update_agent_run(run_id, task_id, activity=activity)
                             yield sse("activity", activity)
                             result = execute_tool(current_task, name, arguments, db)
+                        yield from publish_timing(activity["title"], "tool_ms", tool_started_at)
                         if name in {"apply_patch", "run_command"}:
                             operation = json.loads(result)
                             if operation["status"] in {"queued", "running", "pending_approval"}:
-                                result = json.dumps((yield from wait_for_operation(operation["id"])), ensure_ascii=False)
+                                result = json.dumps((yield from wait_for_operation(operation["id"], activity["title"])), ensure_ascii=False)
                                 update_agent_run(run_id, task_id, status="running")
                                 operation = json.loads(result)
                         if name == "apply_patch":
@@ -2017,9 +2217,14 @@ def stream_continuous_task_message(task_id: str, payload: MessageInput) -> Strea
                     except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, subprocess.SubprocessError) as error:
                         result = json.dumps({"error": str(error)}, ensure_ascii=False)
                         yield sse("activity", {"kind": "error", "title": "tool failed", "detail": str(error)})
-                    request_body["messages"].append({"role": "tool", "tool_call_id": call["id"], "content": result})
-                    save_agent_run_context(run_id, task_id, request_body["messages"])
-            raise ValueError("The model exceeded the local tool-call limit")
+                    tool_message = {"role": "tool", "tool_call_id": call["id"], "content": result}
+                    request_body["messages"].append(tool_message)
+                    audit_messages.append(tool_message)
+                    save_agent_run_context(run_id, task_id, audit_messages)
+                request_body["messages"] = compact_continuous_messages(request_body["messages"])
+            answer = yield from summarize_after_tool_limit()
+            message = complete_run(answer, status="awaiting_input", stage="continuous_run")
+            yield sse("done", {"message": dump_message(message)})
         except Exception as error:
             update_agent_run(run_id, task_id, error=str(error), status="failed")
             with SessionLocal() as db:

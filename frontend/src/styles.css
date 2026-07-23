@@ -57,6 +57,10 @@ header { height: 54px; display: flex; align-items: center; justify-content: spac
 .activity-trace { margin: 0 0 14px; border: 1px solid #dbe4e5; border-radius: 6px; background: #fbfcfc; color: #53616a; font-size: 13px; }
 .activity-trace summary { display: flex; align-items: center; gap: 7px; min-height: 34px; padding: 8px 10px; cursor: pointer; color: #40505a; font-weight: 650; }
 .activity-trace > div { padding: 0 10px 8px; }
+.timing-summary { display: grid; gap: 4px; margin: 5px 0 10px; padding: 8px; border-left: 3px solid #417a9c; background: #f4f8fa; color: #53616a; font-size: 12px; }
+.timing-summary p { display: flex; justify-content: space-between; gap: 12px; margin: 0; }
+.timing-summary p:first-child { color: #334750; }
+.timing-summary strong { color: #334750; font-weight: 650; }
 .activity { display: flex; align-items: flex-start; gap: 8px; margin: 7px 0; color: #687780; }
 .activity svg { flex: 0 0 auto; margin-top: 2px; color: #5d887d; }
 .activity.network svg { color: #417a9c; }
