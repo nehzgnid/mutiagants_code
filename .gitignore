@@ -16,8 +16,11 @@ htmlcov/
 # Node dependencies, Vite output, and TypeScript build metadata
 frontend/node_modules/
 frontend/dist/
+frontend/release/
 frontend/tsconfig.tsbuildinfo
 *.tsbuildinfo
+desktop-backend-dist/
+.desktop-build/
 
 # Runtime state: SQLite data, task worktrees, logs, and provider secrets
 data/

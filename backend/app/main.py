@@ -29,9 +29,13 @@ from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, create
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
-ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = ROOT / "data"
-DATA_DIR.mkdir(exist_ok=True)
+SOURCE_ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.getenv("WORKBENCH_ROOT", str(SOURCE_ROOT))).expanduser().resolve()
+DATA_DIR = Path(os.getenv("WORKBENCH_DATA_DIR", str(ROOT / "data"))).expanduser().resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+FRONTEND_DIST = Path(
+    os.getenv("WORKBENCH_FRONTEND_DIST", str(ROOT / "frontend" / "dist"))
+).expanduser().resolve()
 DATABASE_URL = f"sqlite:///{(DATA_DIR / 'workbench.db').as_posix()}"
 EXECUTOR_IMAGE = os.getenv("EXECUTOR_IMAGE", "local-agent-python:3.12")
 SECRETS_PATH = DATA_DIR / "model-secrets.json"
@@ -2476,7 +2480,7 @@ def send_task_message(task_id: str, payload: MessageInput) -> dict[str, Any]:
 def frontend(path: str):
     if path.startswith("api/"):
         raise HTTPException(404, "API 路径不存在")
-    dist = ROOT / "frontend" / "dist"
+    dist = FRONTEND_DIST
     candidate = dist / path
     if path and candidate.is_file(): return FileResponse(candidate)
     if (dist / "index.html").is_file(): return FileResponse(dist / "index.html")

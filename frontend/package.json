@@ -1,11 +1,20 @@
 {
   "name": "local-agent-workbench-ui",
+  "productName": "Local Agent Workbench",
+  "description": "A local desktop workbench for agent-assisted software development.",
+  "author": "Local Agent Workbench contributors",
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build"
+    "build": "tsc -b && vite build",
+    "desktop:backend": "node scripts/build-desktop-backend.mjs",
+    "desktop:smoke-backend": "node scripts/smoke-desktop-backend.mjs",
+    "desktop:dev": "npm run build && electron .",
+    "desktop:package": "npm run desktop:backend && npm run build && electron-builder",
+    "desktop:package:dir": "npm run desktop:backend && npm run build && electron-builder --dir"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
@@ -19,6 +28,48 @@
   },
   "devDependencies": {
     "@types/react": "latest",
-    "@types/react-dom": "latest"
+    "@types/react-dom": "latest",
+    "electron": "^37.2.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "local.agent.workbench",
+    "productName": "Local Agent Workbench",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../desktop-backend-dist",
+        "to": "backend",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "win": {
+      "target": [
+        "portable"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Development"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.developer-tools"
+    }
   }
 }
